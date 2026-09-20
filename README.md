@@ -117,6 +117,28 @@ main/
 与恢复出厂是两回事。按键引脚、高低电平有效、持续时间都可在 menuconfig 的
 `Jinjian Battery SOC Module` 菜单调整。
 
+## 低功耗与抢占优化
+
+当前硬件**无法把 485/Modbus 放到 LP 核运行**：ESP32-C6 的 LP 核只能使用专用的
+LP_UART（GPIO0/1），且整颗芯片只有一路 LP_UART；本设计的两路 RS485
+（极空 GPIO4/5、车端 GPIO16/17）和 MAX3485 方向脚 GPIO6 都不是 LP 外设，
+需要改板才能考虑 LP 核方案。
+
+固件实现了**无客户端自动低功耗**（`JINJIAN_IDLE_LOW_POWER=y`，默认开启）：
+
+- 无 WiFi 客户端持续 `JINJIAN_IDLE_TIMEOUT_MS`（默认 30s）后自动：
+  - 关闭所有 LED；
+  - 挂起日志流；
+  - 关闭 Web/HTTP；
+  - 关闭 WiFi 射频（`esp_wifi_stop`），同时移除 WiFi 高优先级任务对
+    485/BMS 时序的抢占，改善响应稳定性；
+- 只保留 BMS 采集（UART/BLE）、Modbus 从机和 BOOT 按键监测；
+- **短按 BOOT** 立即唤醒，恢复 WiFi/Web/日志/LED；
+- 长按 BOOT（默认 3s）仍是恢复出厂。
+
+唤醒后若又没有客户端接入，会在超时后再次进入低功耗。该功能可在 menuconfig 的
+`Jinjian Battery SOC Module` 菜单关闭或调整超时。
+
 配置保存到 NVS，提交后自动重启生效。HTTP API：
 
 | 接口 | 方法 | 说明 |

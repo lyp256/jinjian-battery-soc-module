@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "led_ctrl.h"
 #include "nvs_flash.h"
+#include "power_mgr.h"
 #include "sdkconfig.h"
 
 #define FR_TAG        "factory_reset"
@@ -52,6 +53,7 @@ static void factory_reset_task(void *arg)
         } else {
             if (was_pressed) {
                 led_ctrl_boot_hold(false, false);
+                power_mgr_request_wake(); /* 短按 BOOT：从低功耗唤醒 */
                 ESP_LOGI(FR_TAG, "BOOT released (held %u ms), factory reset cancelled",
                          (unsigned)held_ms);
             }

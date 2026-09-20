@@ -191,6 +191,7 @@ static int s_ev_tail;
 static int s_ev_count;
 static bool s_boot_hold;
 static bool s_boot_triggered;
+static bool s_power_save;
 
 /* ---------------- WS2812 输出 ---------------- */
 
@@ -367,6 +368,11 @@ void led_ctrl_boot_hold(bool holding, bool triggered)
     xSemaphoreGive(s_ev_mutex);
 }
 
+void led_ctrl_power_save(bool on)
+{
+    s_power_save = on;
+}
+
 /* ---------------- 状态渲染 ---------------- */
 
 static led_state_t compute_state(const app_config_t *cfg)
@@ -514,7 +520,7 @@ static void led_task(void *arg)
         xSemaphoreGive(s_ev_mutex);
         ota = ota_update_active();
 
-        if (!cfg.led_enable) {
+        if (!cfg.led_enable || s_power_save) {
             render_all_off();
             led_event_flush();
             phase = LED_PHASE_IDLE;

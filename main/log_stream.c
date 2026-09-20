@@ -417,3 +417,17 @@ void log_stream_init(void)
     ESP_LOGI(TAG, "log stream vprintf installed, max=%d", LOG_STREAM_MAX);
     xTaskCreate(log_stream_task, "log_stream", 4096, NULL, 4, &s_task);
 }
+
+void log_stream_suspend(void)
+{
+    if (s_task != NULL) {
+        vTaskSuspend(s_task);
+    }
+}
+
+void log_stream_resume(void)
+{
+    if (s_task != NULL) {
+        vTaskResume(s_task);
+    }
+}

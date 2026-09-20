@@ -18,3 +18,6 @@ void led_ctrl_notify_event(led_event_t ev, bool success);
 /* BOOT 按住期间 WS2812 紫色常亮；触发恢复出厂时切换为红色常亮。
  * holding=false 恢复正常状态显示。 */
 void led_ctrl_boot_hold(bool holding, bool triggered);
+
+/* 低功耗模式：强制所有 LED 熄灭（与 led_enable 配置无关）。 */
+void led_ctrl_power_save(bool on);

@@ -21,9 +21,12 @@
 #include "jk_bms_ble.h"
 #include "log_stream.h"
 #include "ota_update.h"
+#include "power_mgr.h"
 
 static const char *TAG = "web";
 static httpd_handle_t s_server;
+static int s_sta_count;
+static bool s_wifi_inited;
 
 static void json_escape(const char *in, char *out, size_t cap)
 {
@@ -559,8 +562,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     (void)arg;
     (void)base;
     if (id == WIFI_EVENT_AP_STACONNECTED) {
+        s_sta_count++;
+        power_mgr_notify_wifi_client(true);
         ESP_LOGI(TAG, "station connected");
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+        if (s_sta_count > 0) {
+            s_sta_count--;
+        }
+        power_mgr_notify_wifi_client(s_sta_count > 0);
         ESP_LOGI(TAG, "station disconnected");
     } else if (id == WIFI_EVENT_STA_START) {
         (void)data;
@@ -571,11 +580,14 @@ static void start_softap(void)
 {
     app_config_t cfg;
     app_config_get(&cfg);
-    esp_netif_create_default_wifi_ap();
-    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler, NULL, NULL));
+    if (!s_wifi_inited) {
+        esp_netif_create_default_wifi_ap();
+        wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                            &wifi_event_handler, NULL, NULL));
+        s_wifi_inited = true;
+    }
     wifi_config_t wc = {
         .ap = {
             .ssid = {0},
@@ -616,7 +628,7 @@ void web_server_start(void)
         for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
             httpd_register_uri_handler(s_server, &uris[i]);
         }
-        ESP_LOGI(TAG, "http://192.168.4.1");
+    ESP_LOGI(TAG, "http://192.168.4.1");
     }
 }
 
@@ -626,4 +638,17 @@ void web_server_stop(void)
         httpd_stop(s_server);
         s_server = NULL;
     }
+}
+
+void web_server_wifi_stop(void)
+{
+    if (s_wifi_inited) {
+        esp_wifi_stop();
+        ESP_LOGI(TAG, "wifi stopped");
+    }
+}
+
+bool web_server_has_client(void)
+{
+    return s_sta_count > 0;
 }

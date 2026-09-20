@@ -12,6 +12,7 @@
 #include "jk_bms_ble.h"
 #include "jk_bms.h"
 #include "led_ctrl.h"
+#include "power_mgr.h"
 #include "sdkconfig.h"
 #include "web_server.h"
 #include "log_stream.h"
@@ -116,5 +117,6 @@ void app_main(void)
     jinjian_bms_init(&vehicle);
 
     web_server_start();
+    power_mgr_init();
     ESP_LOGI(TAG, "Jinjian battery SOC module started");
 }

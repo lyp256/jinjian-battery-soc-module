@@ -261,4 +261,20 @@ menu "Jinjian Battery SOC Module"
         help
             长按 BOOT 键恢复出厂设置的持续时间。
 
+    config JINJIAN_IDLE_LOW_POWER
+        bool "Auto low-power when no WiFi client"
+        default y
+        help
+            无 WiFi 客户端连接持续 JINJIAN_IDLE_TIMEOUT_MS 后，自动关闭
+            LED、日志流、Web/WiFi，只保留 BMS 采集与 Modbus 从机；
+            短按 BOOT 键唤醒。可显著省电，并消除 WiFi 高优先级任务对
+            485 响应时序的抢占。
+
+    config JINJIAN_IDLE_TIMEOUT_MS
+        int "Idle low-power timeout (ms)"
+        default 30000
+        range 5000 600000
+        help
+            无 WiFi 客户端多久后进入低功耗（毫秒）。
+
 endmenu
