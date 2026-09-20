@@ -1,0 +1,208 @@
+menu "Jinjian Battery SOC Module"
+
+    config JINJIAN_JK_UART_NUM
+        int "Jikong BMS UART number"
+        default 0
+        range 0 1
+        help
+            ESP32 UART peripheral connected to the Jikong BMS.
+
+    config JINJIAN_JK_TX_GPIO
+        int "Jikong BMS TX GPIO"
+        default 4
+        help
+            ESP32-C6 GPIO used as UART TX to the Jikong BMS.
+
+    config JINJIAN_JK_RX_GPIO
+        int "Jikong BMS RX GPIO"
+        default 5
+        help
+            ESP32-C6 GPIO used as UART RX from the Jikong BMS.
+
+    config JINJIAN_JK_BAUD
+        int "Jikong BMS baud rate"
+        default 115200
+        help
+            Jikong RS485 Modbus protocol physical layer baud rate.
+
+    config JINJIAN_JK_SLAVE_ADDR
+        hex "Jikong BMS Modbus slave address"
+        default 0x01
+        range 1 247
+        help
+            Modbus address configured in the Jikong BMS.
+
+    config JINJIAN_JK_POLL_INTERVAL_MS
+        int "Jikong BMS poll interval (ms)"
+        default 3000
+        range 100 60000
+        help
+            How often the module refreshes the Jikong BMS cache.
+
+    config JINJIAN_JK_RESPONSE_TIMEOUT_MS
+        int "Jikong BMS response timeout (ms)"
+        default 150
+        range 10 2000
+        help
+            Timeout for one Jikong Modbus read transaction.
+
+    config JINJIAN_JK_FAST_CHARGE_CURRENT_MA
+        int "Fast charge current threshold (mA)"
+        default 0
+        range 0 200000
+        help
+            Jikong has no fast-charge status. The module reports fast charging when
+            the battery is charging and current is >= this threshold.
+
+    config JINJIAN_LOW_TEMP_CHARGE_C
+        int "Low temperature charge threshold (C)"
+        default -10
+        range -60 30
+        help
+            Extra guard used when the Jikong alarm word has no low-temp charge bit set.
+
+    config JINJIAN_LOW_TEMP_DISCHARGE_C
+        int "Low temperature discharge threshold (C)"
+        default -20
+        range -60 30
+        help
+            Jikong public protocol has no discharge low-temp alarm bit; the module
+            derives this protection flag from the battery temperatures.
+
+    config JINJIAN_CHARGE_TARGET_SOC_DEFAULT
+        int "Default charge target SOC (%)"
+        default 90
+        range 0 100
+        help
+            Jikong has no charge target SOC register. This value is served as
+            Jinjian register 1090 and can be changed by the vehicle.
+
+    config JINJIAN_VEH_UART_NUM
+        int "Vehicle RS485 UART number"
+        default 1
+        range 0 1
+        help
+            ESP32 UART peripheral connected to MAX3485 / vehicle RS485.
+
+    config JINJIAN_VEH_TX_GPIO
+        int "Vehicle RS485 TX GPIO"
+        default 16
+        help
+            ESP32-C6 GPIO used as RS485 UART TX.
+
+    config JINJIAN_VEH_RX_GPIO
+        int "Vehicle RS485 RX GPIO"
+        default 17
+        help
+            ESP32-C6 GPIO used as RS485 UART RX.
+
+    config JINJIAN_VEH_DE_GPIO
+        int "MAX3485 DE/RE GPIO"
+        default 6
+        help
+            GPIO wired to the MAX3485 DE/RE pins (RTS direction control).
+
+    config JINJIAN_VEH_BAUD
+        int "Vehicle RS485 baud rate"
+        default 9600
+        help
+            Jinjian BMS bus physical layer baud rate.
+
+    config JINJIAN_VEH_SLAVE_ADDR
+        hex "Vehicle-facing Modbus slave address"
+        default 0x01
+        range 1 247
+        help
+            Address the module answers on the Jinjian BMS bus.
+
+    config JINJIAN_BMS_TRANSPORT
+        string "Default BMS transport"
+        default "uart"
+        help
+            Default data source: "uart" (极空 485) 或 "ble"（极空蓝牙）。
+            可在 Web 页面修改并保存。
+
+    config JINJIAN_AP_SSID
+        string "SoftAP SSID"
+        default "Jinjian-BMS"
+        help
+            ESP32 热点名称。
+
+    config JINJIAN_AP_PASSWORD
+        string "SoftAP password"
+        default "12345678"
+        help
+            ESP32 热点密码，至少 8 位。
+
+    config JINJIAN_BLE_TARGET_NAME
+        string "Jikong BLE name filter"
+        default "JK"
+        help
+            极空 BMS 广播名子串（大小写不敏感）；留空则按 MAC 连接。
+
+    config JINJIAN_BLE_TARGET_ADDR
+        string "Jikong BLE MAC address"
+        default ""
+        help
+            形如 aa:bb:cc:dd:ee:ff；留空则按名称过滤。
+
+    config JINJIAN_BLE_PROTOCOL
+        int "Jikong BLE protocol version"
+        default 2
+        range 2 3
+        help
+            2=JK02 24S，3=JK02 32S。
+
+    config JINJIAN_BLE_POLL_INTERVAL_MS
+        int "Jikong BLE poll interval (ms)"
+        default 5000
+        range 1000 60000
+
+    config JINJIAN_BLE_SCAN_TIMEOUT_MS
+        int "Jikong BLE scan timeout (ms)"
+        default 20000
+        range 1000 120000
+
+    config JINJIAN_BLE_RECONNECT_INTERVAL_MS
+        int "Jikong BLE reconnect interval (ms)"
+        default 10000
+        range 1000 120000
+
+    config JINJIAN_LOG_STREAM_PORT
+        int "Realtime log stream port"
+        default 8080
+        range 1024 65535
+        help
+            独立 HTTP chunked 日志流端口，主管理页在 80 端口保持可用。
+
+    config JINJIAN_MAX_LOG_STREAMS
+        int "Max concurrent log streams"
+        default 2
+        range 1 8
+        help
+            同时允许打开的 HTTP chunked 日志流数量，超出返回 503。
+
+    config JINJIAN_LOG_LEVEL_DEFAULT
+        int "Default log level"
+        default 3
+        range 0 5
+        help
+            0=NONE 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=VERBOSE。
+            可在 Web 页面动态调整并持久化。
+
+    config JINJIAN_FACTORY_RESET_GPIO
+        int "Factory reset BOOT GPIO"
+        default 9
+        range 0 30
+        help
+            BOOT 键 GPIO（ESP32-C6 开发板通常为 GPIO9）。
+            启动时按住超过 JINJIAN_FACTORY_RESET_HOLD_MS 会清空配置并重启。
+
+    config JINJIAN_FACTORY_RESET_HOLD_MS
+        int "Factory reset hold time (ms)"
+        default 3000
+        range 1000 10000
+        help
+            长按 BOOT 键恢复出厂设置的持续时间。
+
+endmenu
