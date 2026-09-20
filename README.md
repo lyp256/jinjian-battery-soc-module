@@ -97,9 +97,18 @@ main/
 
 ## 恢复出厂设置
 
-- 上电后按住 **BOOT 键**（默认 GPIO9）超过 `JINJIAN_FACTORY_RESET_HOLD_MS`（默认 3000ms）；
-- 期间松开则取消；持续按住会擦除 NVS 配置分区并自动重启，恢复默认配置；
-- 按键引脚与持续时间可在 menuconfig 的 `Jinjian Battery SOC Module` 菜单调整。
+模块运行中**随时**按住 **BOOT 键**（默认 GPIO9）即可触发：
+
+- 按下瞬间 WS2812 变**紫色常亮**作为反馈；
+- 按住超过 `JINJIAN_FACTORY_RESET_HOLD_MS`（默认 3000ms）后 WS2812 变**红色常亮**，
+  随后擦除 NVS 配置分区并自动重启，恢复默认配置；
+- 在到达阈值前松开则取消，恢复正常状态显示。
+
+固件里有一个常驻按键监测任务，串口会打印
+`BOOT pressed / released / factory reset triggered` 日志便于排查。
+注意：BOOT 键同时也是 ESP32 的下载模式引脚，若在复位（EN）时按住会进入下载模式，
+与恢复出厂是两回事。按键引脚、高低电平有效、持续时间都可在 menuconfig 的
+`Jinjian Battery SOC Module` 菜单调整。
 
 配置保存到 NVS，提交后自动重启生效。HTTP API：
 
@@ -117,8 +126,42 @@ main/
 
 - `GET http://192.168.4.1:8080/api/logs/stream`，`Transfer-Encoding: chunked`；
 - 每行日志即时组装为 chunk 推送给已连接页面；
-- 并发流数量受 `JINJIAN_MAX_LOG_STREAMS` 限制（默认 2），超出返回 503；
+- 日志流只保留最新一个客户端（`JINJIAN_MAX_LOG_STREAMS=1`），新客户端连接时会直接关闭旧连接；
 - 只处理实时输出，不缓存历史，客户端断开即释放连接。
+
+## LED 状态指示
+
+板上有三颗 LED：**电源 LED**（默认硬接电源）、**GPIO15 单色状态 LED**、
+**GPIO8 WS2812 RGB LED**。Web 页面“配置”里可勾选“启用 LED 指示灯”，
+保存后立即生效；关闭后所有 LED 熄灭。
+
+两颗状态 LED 分工显示：GPIO15 单色 LED **只作为“任务成功”指示灯**（平时熄灭，
+任务成功时点亮一下）；RGB 负责事件、故障、OTA、BOOT 等场景显示：
+
+| 事件 / 状态 | GPIO15 单色 LED | WS2812 RGB |
+|---|---|---|
+| 收到车端 485 查询 | 成功回应后亮 150ms | 蓝色单闪 |
+| 读取一次 BMS 数据 | 成功拿到数据后亮 150ms | 绿色单闪 |
+| 开机 / 等待 BMS 数据 | 灭 | 灭 |
+| 正常运行且数据新鲜 | 灭 | 灭 |
+| BMS 轮询失败（故障） | 灭 | 橙色闪烁 |
+| BMS 驱动不可用（故障） | 灭 | 红色闪烁 |
+| 多个故障同时存在 | 灭 | 各故障色轮流切换 |
+| OTA 升级 | 灭 | 常亮黄绿交替 |
+| 按住 BOOT | 灭 | 紫色常亮 |
+| 触发恢复出厂 | 灭 | 红色常亮 |
+| LED 总开关关闭 | 灭 | 灭 |
+
+事件说明：485 收到一次查询 → WS2812 蓝色单闪（150ms），若正常回应则 GPIO15
+点亮 150ms，失败不亮；BMS 读取一次 → WS2812 绿色单闪，成功拿到数据则 GPIO15
+点亮 150ms，失败不亮。事件较多时按到达顺序排队显示。
+故障状态不再常亮，而是 250ms 亮 / 250ms 灭闪烁，多个故障时轮流切换各故障颜色，
+故障、OTA、BOOT 状态只由 RGB 表达，GPIO15 保持熄灭。
+
+电源 LED：如果它是接在某个 GPIO 上的，在 menuconfig 里把
+`JINJIAN_PWR_LED_GPIO` 配成对应引脚后，固件会保持常亮（关闭 LED 总开关时熄灭）；
+如果是硬接电源的，则无法用固件控制，出现闪烁通常是供电或 USB 接触问题。
+引脚号和电平极性均可在 menuconfig 的 `Jinjian Battery SOC Module` 菜单调整。
 
 ## 在线 OTA
 

@@ -3,12 +3,15 @@
 
 #include "app_config.h"
 #include "bms_interface.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "factory_reset.h"
 #include "nvs_flash.h"
 #include "jinjian_bms.h"
 #include "jk_bms_ble.h"
 #include "jk_bms.h"
+#include "led_ctrl.h"
 #include "sdkconfig.h"
 #include "web_server.h"
 #include "log_stream.h"
@@ -28,7 +31,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_ret);
 
-    factory_reset_check();
+    /* lwIP/TCP-IP 栈必须先于任何 socket 使用（log_stream 任务会立即创建 socket） */
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     log_stream_init();
     app_config_init();
@@ -36,6 +41,10 @@ void app_main(void)
     app_config_apply_log_level();
     ESP_LOGI(TAG, "app config: transport=%s logLevel=%d",
              s_app_cfg.bms_transport, s_app_cfg.log_level);
+    led_ctrl_init();
+
+    /* 放在 LED 初始化之后：按住 BOOT 时 WS2812 显示紫色，触发恢复出厂变红色 */
+    factory_reset_check();
 
     s_jk_cfg = (jk_bms_config_t){
         .uart_num = CONFIG_JINJIAN_JK_UART_NUM,

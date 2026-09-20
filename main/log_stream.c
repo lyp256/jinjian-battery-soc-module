@@ -270,6 +270,16 @@ static void accept_connection(int listen_fd)
     set_nonblocking(fd);
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    /* 只保留最新一个客户端：新连接到来时先关闭所有旧连接 */
+    bool replaced = false;
+    for (int i = 0; i < LOG_STREAM_MAX; i++) {
+        if (s_conns[i].used) {
+            conn_close_locked(&s_conns[i]);
+            replaced = true;
+        }
+    }
+
     log_stream_conn_t *slot = NULL;
     for (int i = 0; i < LOG_STREAM_MAX; i++) {
         if (!s_conns[i].used) {
@@ -288,9 +298,11 @@ static void accept_connection(int listen_fd)
     slot->used = true;
     slot->fd = fd;
     slot->last_activity_ms = now_ms();
-    ESP_LOGI(TAG, "log stream opened (%d/%d)", (int)(slot - s_conns) + 1,
-             LOG_STREAM_MAX);
+    int slot_no = (int)(slot - s_conns) + 1;
     xSemaphoreGive(s_mutex);
+
+    ESP_LOGI(TAG, "log stream opened (%d/%d)%s", slot_no, LOG_STREAM_MAX,
+             replaced ? ", previous closed" : "");
 }
 
 static void log_stream_task(void *arg)

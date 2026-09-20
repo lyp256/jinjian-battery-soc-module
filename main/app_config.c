@@ -39,6 +39,7 @@ static void set_defaults(void)
     s_cfg.ble_reconnect_ms = CONFIG_JINJIAN_BLE_RECONNECT_INTERVAL_MS;
     s_cfg.jk_uart_poll_ms = CONFIG_JINJIAN_JK_POLL_INTERVAL_MS;
     s_cfg.log_level = CONFIG_JINJIAN_LOG_LEVEL_DEFAULT;
+    s_cfg.led_enable = CONFIG_JINJIAN_LED_ENABLE_DEFAULT;
 }
 
 void app_config_init(void)
@@ -75,6 +76,10 @@ void app_config_init(void)
     int32_t lvl = 0;
     if (nvs_get_i32(h, "log_level", &lvl) == ESP_OK) {
         s_cfg.log_level = (int)lvl;
+    }
+    uint8_t led = 1;
+    if (nvs_get_u8(h, "led_enable", &led) == ESP_OK) {
+        s_cfg.led_enable = led ? true : false;
     }
     nvs_close(h);
 
@@ -118,6 +123,7 @@ void app_config_save(const app_config_t *cfg)
     nvs_set_u32(h, "ble_rec", s_cfg.ble_reconnect_ms);
     nvs_set_u32(h, "uart_poll", s_cfg.jk_uart_poll_ms);
     nvs_set_i32(h, "log_level", s_cfg.log_level);
+    nvs_set_u8(h, "led_enable", s_cfg.led_enable ? 1 : 0);
     nvs_commit(h);
     nvs_close(h);
     ESP_LOGI(TAG, "config saved: transport=%s", s_cfg.bms_transport);

@@ -17,6 +17,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "led_ctrl.h"
+
 static const char *TAG = "jk_ble";
 
 #define JK_BLE_SERVICE_UUID 0xFFE0
@@ -680,10 +682,12 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if,
     case ESP_GATTC_NOTIFY_EVT:
         if (param->notify.handle == s_notify_handle) {
             assemble_notify(param->notify.value, param->notify.value_len);
+            led_ctrl_notify_event(LED_EVENT_BMS, true);
         }
         break;
     case ESP_GATTC_DISCONNECT_EVT:
         ESP_LOGW(TAG, "JK BLE disconnected, reason=0x%02x", param->disconnect.reason);
+        led_ctrl_notify_event(LED_EVENT_BMS, false);
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_snapshot.fresh = false;
         s_snapshot.poll_failures++;

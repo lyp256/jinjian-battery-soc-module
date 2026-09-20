@@ -9,6 +9,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "led_ctrl.h"
 #include "modbus_rtu.h"
 
 static const char *TAG = "jk_bms";
@@ -386,7 +387,8 @@ static void jk_task(void *arg)
             refresh_info();
         }
 
-        if (ok_cells && ok_stats && ok_main) {
+        bool ok_all = ok_cells && ok_stats && ok_main;
+        if (ok_all) {
             apply_stats(cells, JK_REG_CELLS_NUM, cell_stats, stats, JK_REG_STATS_NUM);
             ESP_LOGD(TAG, "JK OK: %.2fV SOC=%u I=%dmA cells=%u",
                      (double)(s_snapshot.total_voltage_raw) / 100.0,
@@ -400,6 +402,8 @@ static void jk_task(void *arg)
             ESP_LOGW(TAG, "JK poll failed: cells=%d stats=%d main=%d",
                      ok_cells, ok_stats, ok_main);
         }
+        /* 绿色闪烁 = 读取 BMS；成功获取数据后单色 LED 再闪一次 */
+        led_ctrl_notify_event(LED_EVENT_BMS, ok_all);
 
         if (s_poll_count % 20 == 0) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);

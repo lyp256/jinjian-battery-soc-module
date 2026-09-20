@@ -177,10 +177,11 @@ menu "Jinjian Battery SOC Module"
 
     config JINJIAN_MAX_LOG_STREAMS
         int "Max concurrent log streams"
-        default 2
+        default 1
         range 1 8
         help
-            同时允许打开的 HTTP chunked 日志流数量，超出返回 503。
+            日志流客户端数量固定为 1；新客户端连接时会直接关闭旧连接，
+            始终只保留最新一个客户端。
 
     config JINJIAN_LOG_LEVEL_DEFAULT
         int "Default log level"
@@ -190,6 +191,54 @@ menu "Jinjian Battery SOC Module"
             0=NONE 1=ERROR 2=WARN 3=INFO 4=DEBUG 5=VERBOSE。
             可在 Web 页面动态调整并持久化。
 
+    config JINJIAN_LED_ENABLE_DEFAULT
+        bool "LED indicators enabled by default"
+        default y
+        help
+            上电默认开启状态指示灯；可在 Web 页面“配置”里随时开关，
+            保存后立即生效（无需重启）。
+
+    config JINJIAN_PWR_LED_GPIO
+        int "Power LED GPIO (-1 = hardwired)"
+        default -1
+        range -1 30
+        help
+            电源 LED 所在的 GPIO。若电源 LED 是硬接电源（不受 MCU 控制），
+            保持 -1；配置为具体引脚后，固件会让它常亮（LED 总开关关闭时熄灭）。
+
+    config JINJIAN_PWR_LED_ACTIVE_LOW
+        bool "Power LED is active low"
+        default n
+        help
+            电源 LED 为低电平点亮时勾选。
+
+    config JINJIAN_STATUS_LED_GPIO
+        int "Status LED GPIO"
+        default 15
+        range -1 30
+        help
+            GPIO15 单色状态 LED；-1 表示未接。
+
+    config JINJIAN_STATUS_LED_ACTIVE_LOW
+        bool "Status LED is active low"
+        default n
+        help
+            状态 LED 为低电平点亮时勾选。
+
+    config JINJIAN_WS2812_GPIO
+        int "WS2812 RGB LED GPIO"
+        default 8
+        range -1 30
+        help
+            WS2812 数据脚（默认 GPIO8）；-1 表示未接。
+
+    config JINJIAN_WS2812_LED_COUNT
+        int "WS2812 LED count"
+        default 1
+        range 1 8
+        help
+            串联的 WS2812 灯珠数量，默认 1。
+
     config JINJIAN_FACTORY_RESET_GPIO
         int "Factory reset BOOT GPIO"
         default 9
@@ -197,6 +246,13 @@ menu "Jinjian Battery SOC Module"
         help
             BOOT 键 GPIO（ESP32-C6 开发板通常为 GPIO9）。
             启动时按住超过 JINJIAN_FACTORY_RESET_HOLD_MS 会清空配置并重启。
+
+    config JINJIAN_FACTORY_RESET_ACTIVE_LOW
+        bool "Factory reset button is active low"
+        default y
+        help
+            多数开发板 BOOT 按键按下接地（低电平有效）。若你的板子按键
+            按下为高电平，取消勾选。
 
     config JINJIAN_FACTORY_RESET_HOLD_MS
         int "Factory reset hold time (ms)"

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define APP_CFG_SSID_LEN  33
@@ -20,6 +21,7 @@ typedef struct {
     uint32_t ble_reconnect_ms;
     uint32_t jk_uart_poll_ms;
     int log_level;                 /* 0..5，对应 esp_log_level_t */
+    bool led_enable;               /* 是否开启 LED 状态指示灯 */
 } app_config_t;
 
 void app_config_init(void);

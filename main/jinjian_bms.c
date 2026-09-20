@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 
 #include "bms_interface.h"
+#include "led_ctrl.h"
 #include "modbus_rtu.h"
 
 static const char *TAG = "jinjian";
@@ -249,6 +250,8 @@ static void process_rx(void)
             uart_write_bytes(s_cfg.uart_num, resp, resp_len);
             log_frame("TX", resp, resp_len);
         }
+        /* 蓝色闪烁 = 收到查询；成功回应后单色 LED 再闪一次 */
+        led_ctrl_notify_event(LED_EVENT_485, resp_len > 0);
     }
 }
 

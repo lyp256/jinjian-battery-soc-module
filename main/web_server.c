@@ -119,6 +119,43 @@ static bool json_get_number(const char *json, const char *key, double *out)
     return true;
 }
 
+static bool json_get_bool(const char *json, const char *key, bool *out)
+{
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (p == NULL) {
+        return false;
+    }
+    p += strlen(pat);
+    while (*p && *p != ':') {
+        p++;
+    }
+    if (*p++ != ':') {
+        return false;
+    }
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    if (strncmp(p, "true", 4) == 0) {
+        *out = true;
+        return true;
+    }
+    if (strncmp(p, "false", 5) == 0) {
+        *out = false;
+        return true;
+    }
+    if (*p == '1') {
+        *out = true;
+        return true;
+    }
+    if (*p == '0') {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
 static void copy_str(char *dst, size_t size, const char *src)
 {
     if (size == 0) {
@@ -164,6 +201,7 @@ static const char PAGE_HTML[] =
     "<label>BLE 扫描超时(ms)</label><input name='bleScanTimeoutMs' type='number' min='1000' max='120000'>"
     "<label>BLE 重连间隔(ms)</label><input name='bleReconnectMs' type='number' min='1000' max='120000'>"
     "<label>UART 轮询间隔(ms)</label><input name='uartPollMs' type='number' min='100' max='60000'>"
+    "<label><input name='ledEnable' type='checkbox'> 启用 LED 指示灯</label>"
     "<br><button type='submit'>保存并重启</button></form></div>"
     "<div class='card'><h3>在线升级</h3>"
     "<input type='file' id='otaFile' accept='.bin'><br>"
@@ -199,7 +237,7 @@ static const char PAGE_HTML[] =
     "f.bleName.value=d.bleName;f.bleAddr.value=d.bleAddr;"
     "f.bleProtocol.value=String(d.bleProtocol);f.blePollMs.value=d.blePollMs;"
     "f.bleScanTimeoutMs.value=d.bleScanTimeoutMs;f.bleReconnectMs.value=d.bleReconnectMs;"
-    "f.uartPollMs.value=d.uartPollMs}catch(e){}}"
+    "f.uartPollMs.value=d.uartPollMs;f.ledEnable.checked=d.ledEnable===true}catch(e){}}"
     "async function loadLevel(){try{const d=await j('/api/status');document.getElementById('logLevel').value=String(d.logLevel)}catch(e){}}"
     "async function startBleScan(){document.getElementById('bleScanState').textContent='扫描中…';await j('/api/ble/scan/start',{method:'POST'});pollBleResults()}"
     "async function pollBleResults(){const d=await j('/api/ble/scan/results');const sel=document.getElementById('bleDevices');"
@@ -231,7 +269,8 @@ static const char PAGE_HTML[] =
     "const body={transport:f.transport.value,apSsid:f.apSsid.value,apPassword:f.apPassword.value,"
     "bleName:f.bleName.value,bleAddr:f.bleAddr.value,bleProtocol:Number(f.bleProtocol.value),"
     "blePollMs:Number(f.blePollMs.value),bleScanTimeoutMs:Number(f.bleScanTimeoutMs.value),"
-    "bleReconnectMs:Number(f.bleReconnectMs.value),uartPollMs:Number(f.uartPollMs.value)};"
+    "bleReconnectMs:Number(f.bleReconnectMs.value),uartPollMs:Number(f.uartPollMs.value),"
+    "ledEnable:f.ledEnable.checked};"
     "const d=await j('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
     "alert(d.ok?'已保存，正在重启':'保存失败')};"
     "loadStatus();loadCfg();loadLevel();startLogs();setInterval(loadStatus,2000);</script></body></html>";
@@ -313,11 +352,11 @@ static esp_err_t handle_config_get(httpd_req_t *req)
              "{\"transport\":\"%s\",\"apSsid\":\"%s\",\"apPassword\":\"%s\","
              "\"bleName\":\"%s\",\"bleAddr\":\"%s\",\"bleProtocol\":%d,"
              "\"blePollMs\":%u,\"bleScanTimeoutMs\":%u,\"bleReconnectMs\":%u,"
-             "\"uartPollMs\":%u,\"logLevel\":%d}",
+             "\"uartPollMs\":%u,\"logLevel\":%d,\"ledEnable\":%s}",
              t, s, p, bn, ba, cfg.ble_protocol,
              (unsigned)cfg.ble_poll_ms, (unsigned)cfg.ble_scan_timeout_ms,
              (unsigned)cfg.ble_reconnect_ms, (unsigned)cfg.jk_uart_poll_ms,
-             cfg.log_level);
+             cfg.log_level, cfg.led_enable ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
@@ -368,6 +407,10 @@ static esp_err_t handle_config_post(httpd_req_t *req)
     }
     if (json_get_number(buf, "logLevel", &num)) {
         cfg.log_level = (int)num;
+    }
+    bool led = true;
+    if (json_get_bool(buf, "ledEnable", &led)) {
+        cfg.led_enable = led;
     }
 
     if (strcmp(cfg.bms_transport, "uart") != 0 && strcmp(cfg.bms_transport, "ble") != 0) {
@@ -528,8 +571,6 @@ static void start_softap(void)
 {
     app_config_t cfg;
     app_config_get(&cfg);
-    esp_netif_init();
-    esp_event_loop_create_default();
     esp_netif_create_default_wifi_ap();
     wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
@@ -557,6 +598,7 @@ void web_server_start(void)
     start_softap();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192;
+    cfg.max_uri_handlers = 12;
     cfg.recv_wait_timeout = 60;
     cfg.send_wait_timeout = 60;
     if (httpd_start(&s_server, &cfg) == ESP_OK) {
