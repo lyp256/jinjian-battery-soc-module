@@ -45,6 +45,13 @@ idf.py build
 idf.py -p COMx flash monitor
 ```
 
+若用 **JTAG（OpenOCD）** 烧录（本工程 VS Code 默认就是 JTAG），烧完后建议再执行一次
+完整硬复位，避免烧录后卡死、需要手动按 RST：
+
+```powershell
+python -m esptool --chip esp32c6 -p COMx -b 115200 --after hard-reset read-mac
+```
+
 项目已带 `sdkconfig.defaults`，控制台走 USB-Serial/JTAG，`UART0` 专用于极空。
 固件加入蓝牙 + WiFi 后体积较大，已默认使用 **无 factory 双 OTA** 分区
 （`ota_0`/`ota_1` 各 1700K），Flash 按 4MB 配置。
@@ -187,7 +194,7 @@ main/
 | 104 | 循环次数 | `0x12B0` | clamp 0–65535 |
 | 110 | 均衡状态 | `0x12A6` 高字节 | 非 0 → 1 |
 | 113 | 标称容量 | `0x12AC` | `/1000` |
-| 1000–1007 | PN | `0x1300` ManufacturerDeviceID (16 ASCII) | 直传 |
+| 1000–1007 | PN | 模块自身 PN（由本机 MAC 派生，形如 `SOC-9888E072BD78`，16 ASCII） | 生成 |
 | 1016/1017 | 版本 | `0x1318` SoftwareVersion (8 ASCII) | 解析 a.b.c.d |
 | 1089 | 充电时间 | `0x1104` RCVTime（0.1H） | ×6 → 分钟 |
 | 1090 | 目标 SOC | —（极空无此配置） | 本地缓存，默认 90% |

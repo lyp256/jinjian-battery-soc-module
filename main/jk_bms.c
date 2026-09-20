@@ -197,7 +197,7 @@ static void refresh_info(void)
         }
 
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        memcpy(s_snapshot.pn, pn, sizeof(pn));
+        /* 模块自身 PN 由 MAC 派生，不覆盖为极空的 PN */
         parse_version(sw, sizeof(sw), s_snapshot.version_regs);
         xSemaphoreGive(s_mutex);
         ESP_LOGI(TAG, "JK info: pn=%s sw=%02X%02X/%02X%02X",
@@ -429,7 +429,7 @@ int jk_bms_uart_init(void *config)
     s_snapshot.charge_time_min = 60;
     s_snapshot.charge_target_soc = cfg->charge_target_soc;
     s_snapshot.version_regs[0] = 0x0100;
-    memcpy(s_snapshot.pn, "JIKONG0000000000", 17);
+    bms_mac_pn(s_snapshot.pn, sizeof(s_snapshot.pn));
     s_charge_time_overridden = false;
 
     uart_config_t uart_cfg = {

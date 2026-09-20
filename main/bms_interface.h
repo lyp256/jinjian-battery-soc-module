@@ -58,3 +58,7 @@ bool bms_manager_get_snapshot(bms_snapshot_t *out);
 void bms_manager_set_charge_time_min(uint16_t minutes);
 void bms_manager_set_charge_target_soc(uint16_t soc);
 void bms_manager_end_fast_charge(void);
+
+/* 根据本机 WiFi MAC 生成 16 位唯一 PN（形如 SOC-9888E072BD78），
+ * 供金箭从机 / Web 页面作为模块自身序列号使用。 */
+void bms_mac_pn(char *pn, size_t cap);

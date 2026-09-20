@@ -268,7 +268,7 @@ static void decode_device_info(const uint8_t *d, size_t len)
     text_to_pn(d + 30, 8, sw, sizeof(sw));
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    memcpy(s_snapshot.pn, model, sizeof(model));
+    /* 模块自身 PN 由 MAC 派生，不覆盖为极空的型号 */
     parse_version(d + 30, 8, s_snapshot.version_regs);
     xSemaphoreGive(s_mutex);
     ESP_LOGI(TAG, "JK BLE device: model=%s sw=%s", model, sw);
@@ -757,7 +757,7 @@ int jk_bms_ble_init(void *config)
     s_snapshot.charge_time_min = 60;
     s_snapshot.charge_target_soc = cfg->charge_target_soc;
     s_snapshot.version_regs[0] = 0x0100;
-    text_to_pn((const uint8_t *)"JIKONG0000000000", 16, s_snapshot.pn, sizeof(s_snapshot.pn));
+    bms_mac_pn(s_snapshot.pn, sizeof(s_snapshot.pn));
     s_stop_requested = false;
 
     jk_ble_stack_init();
