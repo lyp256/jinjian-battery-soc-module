@@ -33,5 +33,6 @@
     "--query-driver=**",
     "--compile-commands-dir=f:\\jinjian\\jinjian-battery-soc-module\\jinjian-battery-soc-module\\build"
   ],
-  "idf.flashType": "JTAG"
+  "idf.flashType": "JTAG",
+  "idf.monitorPort": "COM12"
 }
