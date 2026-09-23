@@ -1,3 +1,3 @@
-{"type":"DOCHEAD"}||{"docType":"SCH","client":"77d670f911f4cbe8","uuid":"2ee17b891ec6c196","updateTime":1790094507023,"version":"1790094507023","editVersion":"4.1.60","user":{}}|
+{"type":"DOCHEAD"}||{"docType":"SCH","client":"30ce22889d009005","uuid":"2ee17b891ec6c196","updateTime":1790094507023,"version":"1790094507023","editVersion":"4.1.60","user":{}}|
 {"type":"RULE","ticket":4,"id":"[\"RULE\",\"TRACK\",\"copperThickness2oz\"]"}||{"ruleState":"NORMAL","ruleContext":{"unit":"mm","track":{"isOpen":true,"content":[{"layerId":1,"stroDef":0.254,"stroMax":2.54,"stroMin":0.203}]}}}|
 {"type":"META","ticket":10920,"id":"META"}||{"title":"Schematic1","source":"","board":"115bf41c32edc812","zIndex":null}

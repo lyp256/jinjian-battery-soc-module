@@ -2,8 +2,8 @@
   "name": "bms-soc",
   "owner_uuid": "4dba89058db64fc9a0ed00ed5ff3037b",
   "creator_uuid": "4dba89058db64fc9a0ed00ed5ff3037b",
-  "created_at": "2026-09-23 11:20:41",
-  "updated_at": "2026-09-23 11:20:41",
+  "created_at": "2026-09-24 10:11:35",
+  "updated_at": "2026-09-24 10:11:35",
   "modifier_uuid": "4dba89058db64fc9a0ed00ed5ff3037b",
   "content": "",
   "archive": false,
@@ -17,7 +17,7 @@
   "branch_uuid": "",
   "pcb_count": 0,
   "format": "folder",
-  "config": "{\"type\":\"DOCHEAD\"}||{\"docType\":\"BOARD\",\"client\":\"77d670f911f4cbe8\",\"uuid\":\"115bf41c32edc812\",\"updateTime\":1790133046907,\"version\":\"1790133046907\",\"editVersion\":\"4.1.60\",\"user\":{}}|\n{\"type\":\"META\",\"ticket\":2,\"id\":\"META\"}||{\"title\":\"pcb\",\"zIndex\":1}|\n{\"type\":\"DOCHEAD\"}||{\"docType\":\"CONFIG\",\"client\":\"77d670f911f4cbe8\",\"uuid\":\"CONFIG\",\"updateTime\":1790133046905,\"version\":\"1790133046905\",\"editVersion\":\"4.1.60\",\"user\":{\"uuid\":\"4dba89058db64fc9a0ed00ed5ff3037b\",\"nickname\":\"\",\"username\":\"\"}}|\n{\"type\":\"META\",\"ticket\":1,\"id\":\"META\"}||{\"defaultSheet\":\"8a96dd782e70e07e\"}",
+  "config": "{\"type\":\"DOCHEAD\"}||{\"docType\":\"BOARD\",\"client\":\"30ce22889d009005\",\"uuid\":\"115bf41c32edc812\",\"updateTime\":1790175037556,\"version\":\"1790175037556\",\"editVersion\":\"4.1.60\",\"user\":{}}|\n{\"type\":\"META\",\"ticket\":3,\"id\":\"META\",\"firstTicket\":2}||{\"title\":\"pcb\",\"zIndex\":1}|\n{\"type\":\"DOCHEAD\"}||{\"docType\":\"CONFIG\",\"client\":\"30ce22889d009005\",\"uuid\":\"CONFIG\",\"updateTime\":1790158206740,\"version\":\"1790158206740\",\"editVersion\":\"4.1.60\",\"user\":{\"uuid\":\"0d0ab559f05e4569b589850215616f4d\",\"nickname\":\"\",\"username\":\"\"}}|\n{\"type\":\"META\",\"ticket\":1,\"id\":\"META\"}||{\"defaultSheet\":\"8a96dd782e70e07e\"}",
   "profile": {
     "boards": {
       "115bf41c32edc812": {
@@ -43,8 +43,8 @@
         "schematic_uuid": "2ee17b891ec6c196",
         "zIndex": 1,
         "source": "",
-        "version": "1790132842380",
-        "updateTime": 1790132842380
+        "version": "1790213532186",
+        "updateTime": 1790213532186
       }
     },
     "pcbs": {
@@ -55,8 +55,8 @@
         "zIndex": null,
         "parent_uuid": "",
         "source": "",
-        "version": "1790132770016",
-        "updateTime": 1790132770016
+        "version": "1790215389083",
+        "updateTime": 1790215389083
       }
     },
     "panels": {
