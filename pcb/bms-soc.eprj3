@@ -1,0 +1,76 @@
+{
+  "name": "bms-soc",
+  "owner_uuid": "4dba89058db64fc9a0ed00ed5ff3037b",
+  "creator_uuid": "4dba89058db64fc9a0ed00ed5ff3037b",
+  "created_at": "2026-09-23 11:20:41",
+  "updated_at": "2026-09-23 11:20:41",
+  "modifier_uuid": "4dba89058db64fc9a0ed00ed5ff3037b",
+  "content": "",
+  "archive": false,
+  "cbb_project": 0,
+  "thumb": "",
+  "ticket": 1,
+  "g_ticket": 1,
+  "boards": [],
+  "block_symbol_attrs_groups": {},
+  "default_sheet": "",
+  "branch_uuid": "",
+  "pcb_count": 0,
+  "format": "folder",
+  "config": "{\"type\":\"DOCHEAD\"}||{\"docType\":\"BOARD\",\"client\":\"77d670f911f4cbe8\",\"uuid\":\"115bf41c32edc812\",\"updateTime\":1790133046907,\"version\":\"1790133046907\",\"editVersion\":\"4.1.60\",\"user\":{}}|\n{\"type\":\"META\",\"ticket\":2,\"id\":\"META\"}||{\"title\":\"pcb\",\"zIndex\":1}|\n{\"type\":\"DOCHEAD\"}||{\"docType\":\"CONFIG\",\"client\":\"77d670f911f4cbe8\",\"uuid\":\"CONFIG\",\"updateTime\":1790133046905,\"version\":\"1790133046905\",\"editVersion\":\"4.1.60\",\"user\":{\"uuid\":\"4dba89058db64fc9a0ed00ed5ff3037b\",\"nickname\":\"\",\"username\":\"\"}}|\n{\"type\":\"META\",\"ticket\":1,\"id\":\"META\"}||{\"defaultSheet\":\"8a96dd782e70e07e\"}",
+  "profile": {
+    "boards": {
+      "115bf41c32edc812": {
+        "uuid": "115bf41c32edc812",
+        "title": "pcb",
+        "zIndex": 1
+      }
+    },
+    "schematics": {
+      "2ee17b891ec6c196": {
+        "uuid": "2ee17b891ec6c196",
+        "name": "Schematic1",
+        "board": "115bf41c32edc812",
+        "source": "",
+        "version": "1790094507023",
+        "updateTime": 1790094507023
+      }
+    },
+    "sheets": {
+      "7bad3902214cc748": {
+        "uuid": "7bad3902214cc748",
+        "title": "bms-soc",
+        "schematic_uuid": "2ee17b891ec6c196",
+        "zIndex": 1,
+        "source": "",
+        "version": "1790132842380",
+        "updateTime": 1790132842380
+      }
+    },
+    "pcbs": {
+      "773aa11f0e80897c": {
+        "uuid": "773aa11f0e80897c",
+        "title": "pcb",
+        "board": "115bf41c32edc812",
+        "zIndex": null,
+        "parent_uuid": "",
+        "source": "",
+        "version": "1790132770016",
+        "updateTime": 1790132770016
+      }
+    },
+    "panels": {
+      "e59020ce5666233c": {
+        "uuid": "e59020ce5666233c",
+        "title": "Panel1",
+        "zIndex": null
+      }
+    },
+    "blockSymbols": {},
+    "owner": {
+      "uuid": "D:\\project\\jinjian-battery-soc-module",
+      "username": "",
+      "nickname": ""
+    }
+  }
+}

@@ -1,3 +1,0 @@
-{"type":"DOCHEAD"}||{"docType":"SCH","client":"9499d742dcb81b7b","uuid":"2ee17b891ec6c196","updateTime":1790094507023,"version":"1790094507023","editVersion":"4.1.60","user":{}}|
-{"type":"META","ticket":10920,"id":"META"}||{"title":"Schematic1","source":"","board":"115bf41c32edc812","zIndex":null}|
-{"type":"RULE","ticket":4,"id":"[\"RULE\",\"TRACK\",\"copperThickness2oz\"]"}||{"ruleState":"NORMAL","ruleContext":{"unit":"mm","track":{"isOpen":true,"content":[{"layerId":1,"stroDef":0.254,"stroMax":2.54,"stroMin":0.203}]}}}
