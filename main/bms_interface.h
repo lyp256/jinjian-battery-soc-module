@@ -14,13 +14,22 @@ typedef struct {
     uint32_t last_ok_ms; /* esp_timer 单调时钟 */
 
     uint16_t total_voltage_raw;   /* 0.01V */
+    uint32_t total_voltage_mv;    /* mV，上报/BLE 用原始精度 */
     uint8_t cell_count;
     uint8_t soc;
     uint16_t capacity_ah;
     int16_t charge_current_raw;   /* 0.01A，充正放负 */
+    int32_t charge_current_ma;    /* mA，充正放负 */
     int16_t temp1;
     int16_t temp2;
     int16_t board_temp;
+    int16_t temp1_tenths;         /* 0.1℃ 原始值 */
+    int16_t temp2_tenths;
+    int16_t board_temp_tenths;
+
+    uint16_t balan_current_ma;    /* 均衡电流 mA */
+    int32_t capacity_remain_mah;  /* 剩余容量 mAh */
+    uint32_t cycle_capacity_mah;  /* 循环总容量 mAh（SOCCycleCap） */
 
     uint16_t cell_mv[BMS_MAX_CELLS];
     uint16_t max_cell_diff_mv;

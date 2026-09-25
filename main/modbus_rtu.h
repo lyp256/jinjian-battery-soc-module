@@ -35,6 +35,8 @@ bool modbus_check_crc(const uint8_t *frame, size_t len);
 size_t modbus_build_read_regs(uint8_t *dst, uint8_t slave, uint16_t addr, uint16_t num);
 size_t modbus_build_read_coils(uint8_t *dst, uint8_t slave, uint16_t addr, uint16_t num);
 size_t modbus_build_write_reg(uint8_t *dst, uint8_t slave, uint16_t addr, uint16_t value);
+size_t modbus_build_write_regs(uint8_t *dst, uint8_t slave, uint16_t addr,
+                               const uint16_t *values, size_t count);
 size_t modbus_build_write_coil(uint8_t *dst, uint8_t slave, uint16_t addr, bool on);
 
 /* Scan the buffer from every offset and return the first valid Modbus RTU

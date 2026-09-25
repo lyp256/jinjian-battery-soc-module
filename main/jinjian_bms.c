@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -291,6 +292,19 @@ void jinjian_bms_init(const jinjian_bms_config_t *cfg)
 {
     s_cfg = *cfg;
 
+    /* THVD1406DR 是自动方向收发器（D 脚一有下降沿就使能驱动），
+     * 没有 DE 控制脚，因此这里用普通 UART 模式；
+     * 初始化前先把 TX 拉高，避免模块刚上电时把杂波发到车端总线上。 */
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << cfg->tx_gpio,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+    gpio_set_level(cfg->tx_gpio, 1);
+
     uart_config_t uart_cfg = {
         .baud_rate = cfg->baud_rate,
         .data_bits = UART_DATA_8_BITS,
@@ -301,10 +315,10 @@ void jinjian_bms_init(const jinjian_bms_config_t *cfg)
     };
     ESP_ERROR_CHECK(uart_param_config(cfg->uart_num, &uart_cfg));
     ESP_ERROR_CHECK(uart_set_pin(cfg->uart_num, cfg->tx_gpio, cfg->rx_gpio,
-                                 cfg->de_gpio, -1));
+                                 -1, -1));
     ESP_ERROR_CHECK(uart_driver_install(cfg->uart_num, 1024, 0, 16,
                                         &s_uart_queue, 0));
-    ESP_ERROR_CHECK(uart_set_mode(cfg->uart_num, UART_MODE_RS485_HALF_DUPLEX));
+    ESP_ERROR_CHECK(uart_set_mode(cfg->uart_num, UART_MODE_UART));
     ESP_ERROR_CHECK(uart_set_rx_timeout(cfg->uart_num, 2));
 
     xTaskCreate(jinjian_task, "jinjian_rs485", 4096, NULL, 6, NULL);

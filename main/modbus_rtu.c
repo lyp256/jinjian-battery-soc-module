@@ -71,6 +71,29 @@ size_t modbus_build_write_reg(uint8_t *dst, uint8_t slave, uint16_t addr, uint16
     return 8;
 }
 
+/* 写多个保持寄存器（功能码 0x10），供 RPC bms.setParam / writeRegisters 使用 */
+size_t modbus_build_write_regs(uint8_t *dst, uint8_t slave, uint16_t addr,
+                               const uint16_t *values, size_t count)
+{
+    if (count == 0 || count > 123) {
+        return 0;
+    }
+    dst[0] = slave;
+    dst[1] = MODBUS_FUNC_WRITE_REGS;
+    dst[2] = (uint8_t)(addr >> 8);
+    dst[3] = (uint8_t)(addr & 0xFF);
+    dst[4] = (uint8_t)(count >> 8);
+    dst[5] = (uint8_t)(count & 0xFF);
+    dst[6] = (uint8_t)(count * 2);
+    for (size_t i = 0; i < count; i++) {
+        dst[7 + i * 2] = (uint8_t)(values[i] >> 8);
+        dst[8 + i * 2] = (uint8_t)(values[i] & 0xFF);
+    }
+    size_t body = 7 + count * 2;
+    modbus_append_crc(dst, body);
+    return body + 2;
+}
+
 size_t modbus_build_write_coil(uint8_t *dst, uint8_t slave, uint16_t addr, bool on)
 {
     dst[0] = slave;

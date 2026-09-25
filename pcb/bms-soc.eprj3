@@ -1,10 +1,10 @@
 {
   "name": "bms-soc",
-  "owner_uuid": "4dba89058db64fc9a0ed00ed5ff3037b",
-  "creator_uuid": "4dba89058db64fc9a0ed00ed5ff3037b",
-  "created_at": "2026-09-24 10:11:35",
-  "updated_at": "2026-09-24 10:11:35",
-  "modifier_uuid": "4dba89058db64fc9a0ed00ed5ff3037b",
+  "owner_uuid": "0d0ab559f05e4569b589850215616f4d",
+  "creator_uuid": "0d0ab559f05e4569b589850215616f4d",
+  "created_at": "2026-09-24 10:33:33",
+  "updated_at": "2026-09-24 10:33:33",
+  "modifier_uuid": "0d0ab559f05e4569b589850215616f4d",
   "content": "",
   "archive": false,
   "cbb_project": 0,
@@ -13,16 +13,24 @@
   "g_ticket": 1,
   "boards": [],
   "block_symbol_attrs_groups": {},
-  "default_sheet": "",
+  "default_sheet": "8a96dd782e70e07e",
   "branch_uuid": "",
   "pcb_count": 0,
   "format": "folder",
-  "config": "{\"type\":\"DOCHEAD\"}||{\"docType\":\"BOARD\",\"client\":\"30ce22889d009005\",\"uuid\":\"115bf41c32edc812\",\"updateTime\":1790175037556,\"version\":\"1790175037556\",\"editVersion\":\"4.1.60\",\"user\":{}}|\n{\"type\":\"META\",\"ticket\":3,\"id\":\"META\",\"firstTicket\":2}||{\"title\":\"pcb\",\"zIndex\":1}|\n{\"type\":\"DOCHEAD\"}||{\"docType\":\"CONFIG\",\"client\":\"30ce22889d009005\",\"uuid\":\"CONFIG\",\"updateTime\":1790158206740,\"version\":\"1790158206740\",\"editVersion\":\"4.1.60\",\"user\":{\"uuid\":\"0d0ab559f05e4569b589850215616f4d\",\"nickname\":\"\",\"username\":\"\"}}|\n{\"type\":\"META\",\"ticket\":1,\"id\":\"META\"}||{\"defaultSheet\":\"8a96dd782e70e07e\"}",
+  "config": {
+    "defaultSheet": "8a96dd782e70e07e",
+    "settings": {}
+  },
   "profile": {
     "boards": {
       "115bf41c32edc812": {
         "uuid": "115bf41c32edc812",
         "title": "pcb",
+        "zIndex": 1
+      },
+      "45c5bdca7a8d58b2": {
+        "uuid": "45c5bdca7a8d58b2",
+        "title": "pcb-2",
         "zIndex": 1
       }
     },
@@ -32,8 +40,16 @@
         "name": "Schematic1",
         "board": "115bf41c32edc812",
         "source": "",
-        "version": "1790094507023",
-        "updateTime": 1790094507023
+        "version": "1790243472554",
+        "updateTime": 1790243472554
+      },
+      "d3ef1a811de78e61": {
+        "uuid": "d3ef1a811de78e61",
+        "name": "Schematic1_1",
+        "board": "45c5bdca7a8d58b2",
+        "source": "",
+        "version": "1790243472554",
+        "updateTime": 1790244031691
       }
     },
     "sheets": {
@@ -43,8 +59,17 @@
         "schematic_uuid": "2ee17b891ec6c196",
         "zIndex": 1,
         "source": "",
-        "version": "1790213532186",
-        "updateTime": 1790213532186
+        "version": "1790243472554",
+        "updateTime": 1790243472554
+      },
+      "f2cbe5992d35b559": {
+        "uuid": "f2cbe5992d35b559",
+        "title": "bms-soc",
+        "schematic_uuid": "d3ef1a811de78e61",
+        "zIndex": 1,
+        "source": "",
+        "version": "1790243472554",
+        "updateTime": 1790244031691
       }
     },
     "pcbs": {
@@ -52,11 +77,19 @@
         "uuid": "773aa11f0e80897c",
         "title": "pcb",
         "board": "115bf41c32edc812",
-        "zIndex": null,
         "parent_uuid": "",
         "source": "",
-        "version": "1790215389083",
-        "updateTime": 1790215389083
+        "version": "1790243888491",
+        "updateTime": 1790243888491
+      },
+      "7b6d01da3b2c1ab8": {
+        "uuid": "7b6d01da3b2c1ab8",
+        "title": "pcb_1",
+        "board": "45c5bdca7a8d58b2",
+        "parent_uuid": "",
+        "source": "",
+        "version": "1790244614082",
+        "updateTime": 1790244614082
       }
     },
     "panels": {
@@ -68,9 +101,9 @@
     },
     "blockSymbols": {},
     "owner": {
-      "uuid": "D:\\project\\jinjian-battery-soc-module",
-      "username": "",
-      "nickname": ""
-    }
+      "uuid": "0d0ab559f05e4569b589850215616f4d"
+    },
+    "simSchematics": {},
+    "simulations": {}
   }
 }

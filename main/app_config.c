@@ -38,6 +38,25 @@ static void set_defaults(void)
     s_cfg.ble_scan_timeout_ms = CONFIG_JINJIAN_BLE_SCAN_TIMEOUT_MS;
     s_cfg.ble_reconnect_ms = CONFIG_JINJIAN_BLE_RECONNECT_INTERVAL_MS;
     s_cfg.jk_uart_poll_ms = CONFIG_JINJIAN_JK_POLL_INTERVAL_MS;
+#ifdef CONFIG_JINJIAN_LTE_ENABLE
+    s_cfg.lte_enable = true;
+#else
+    s_cfg.lte_enable = false;
+#endif
+    snprintf(s_cfg.lte_apn, sizeof(s_cfg.lte_apn), "%s", CONFIG_JINJIAN_LTE_APN);
+#ifdef CONFIG_JINJIAN_MQTT_ENABLE
+    s_cfg.mqtt_enable = true;
+#else
+    s_cfg.mqtt_enable = false;
+#endif
+    snprintf(s_cfg.mqtt_host, sizeof(s_cfg.mqtt_host), "%s", CONFIG_JINJIAN_MQTT_BROKER_HOST);
+    s_cfg.mqtt_port = (uint16_t)CONFIG_JINJIAN_MQTT_BROKER_PORT;
+    snprintf(s_cfg.mqtt_user, sizeof(s_cfg.mqtt_user), "%s", CONFIG_JINJIAN_MQTT_USERNAME);
+    snprintf(s_cfg.mqtt_password, sizeof(s_cfg.mqtt_password), "%s", CONFIG_JINJIAN_MQTT_PASSWORD);
+    snprintf(s_cfg.mqtt_prefix, sizeof(s_cfg.mqtt_prefix), "%s", CONFIG_JINJIAN_MQTT_TOPIC_PREFIX);
+    s_cfg.mqtt_sample_ms = CONFIG_JINJIAN_MQTT_SAMPLE_INTERVAL_MS;
+    s_cfg.mqtt_batch = (uint8_t)CONFIG_JINJIAN_MQTT_BATCH_SAMPLES;
+    s_cfg.mqtt_keepalive_s = (uint16_t)CONFIG_JINJIAN_MQTT_KEEPALIVE_S;
     s_cfg.log_level = CONFIG_JINJIAN_LOG_LEVEL_DEFAULT;
     s_cfg.led_enable = CONFIG_JINJIAN_LED_ENABLE_DEFAULT;
 }
@@ -73,6 +92,33 @@ void app_config_init(void)
     nvs_get_u32(h, "ble_scan", &s_cfg.ble_scan_timeout_ms);
     nvs_get_u32(h, "ble_rec", &s_cfg.ble_reconnect_ms);
     nvs_get_u32(h, "uart_poll", &s_cfg.jk_uart_poll_ms);
+    uint8_t lte_en = 1;
+    if (nvs_get_u8(h, "lte_en", &lte_en) == ESP_OK) {
+        s_cfg.lte_enable = lte_en ? true : false;
+    }
+    if (nvs_get_str(h, "lte_apn", NULL, &len) == ESP_OK && len <= sizeof(s_cfg.lte_apn)) {
+        nvs_get_str(h, "lte_apn", s_cfg.lte_apn, &len);
+    }
+    uint8_t mq_en = 1;
+    if (nvs_get_u8(h, "mq_en", &mq_en) == ESP_OK) {
+        s_cfg.mqtt_enable = mq_en ? true : false;
+    }
+    if (nvs_get_str(h, "mq_host", NULL, &len) == ESP_OK && len <= sizeof(s_cfg.mqtt_host)) {
+        nvs_get_str(h, "mq_host", s_cfg.mqtt_host, &len);
+    }
+    nvs_get_u16(h, "mq_port", &s_cfg.mqtt_port);
+    if (nvs_get_str(h, "mq_user", NULL, &len) == ESP_OK && len <= sizeof(s_cfg.mqtt_user)) {
+        nvs_get_str(h, "mq_user", s_cfg.mqtt_user, &len);
+    }
+    if (nvs_get_str(h, "mq_pass", NULL, &len) == ESP_OK && len <= sizeof(s_cfg.mqtt_password)) {
+        nvs_get_str(h, "mq_pass", s_cfg.mqtt_password, &len);
+    }
+    if (nvs_get_str(h, "mq_pfx", NULL, &len) == ESP_OK && len <= sizeof(s_cfg.mqtt_prefix)) {
+        nvs_get_str(h, "mq_pfx", s_cfg.mqtt_prefix, &len);
+    }
+    nvs_get_u32(h, "mq_smpl", &s_cfg.mqtt_sample_ms);
+    nvs_get_u8(h, "mq_batch", &s_cfg.mqtt_batch);
+    nvs_get_u16(h, "mq_ka", &s_cfg.mqtt_keepalive_s);
     int32_t lvl = 0;
     if (nvs_get_i32(h, "log_level", &lvl) == ESP_OK) {
         s_cfg.log_level = (int)lvl;
@@ -92,12 +138,36 @@ void app_config_init(void)
     if (s_cfg.log_level < 0 || s_cfg.log_level > 5) {
         s_cfg.log_level = CONFIG_JINJIAN_LOG_LEVEL_DEFAULT;
     }
+    if (s_cfg.mqtt_sample_ms < 200 || s_cfg.mqtt_sample_ms > 60000) {
+        s_cfg.mqtt_sample_ms = CONFIG_JINJIAN_MQTT_SAMPLE_INTERVAL_MS;
+    }
+    if (s_cfg.mqtt_batch < 1 || s_cfg.mqtt_batch > 30) {
+        s_cfg.mqtt_batch = (uint8_t)CONFIG_JINJIAN_MQTT_BATCH_SAMPLES;
+    }
+    if (s_cfg.mqtt_keepalive_s < 15 || s_cfg.mqtt_keepalive_s > 600) {
+        s_cfg.mqtt_keepalive_s = (uint16_t)CONFIG_JINJIAN_MQTT_KEEPALIVE_S;
+    }
+    if (s_cfg.mqtt_port == 0) {
+        s_cfg.mqtt_port = (uint16_t)CONFIG_JINJIAN_MQTT_BROKER_PORT;
+    }
+    if (s_cfg.mqtt_prefix[0] == '\0') {
+        snprintf(s_cfg.mqtt_prefix, sizeof(s_cfg.mqtt_prefix), "%s",
+                 CONFIG_JINJIAN_MQTT_TOPIC_PREFIX);
+    }
     if (s_cfg.ap_ssid[0] == '\0' ||
         strcmp(s_cfg.ap_ssid, CONFIG_JINJIAN_AP_SSID) == 0) {
         build_unique_ssid(s_cfg.ap_ssid, sizeof(s_cfg.ap_ssid));
     }
-    ESP_LOGI(TAG, "config: transport=%s ap=%s ble=%s/%s",
-             s_cfg.bms_transport, s_cfg.ap_ssid, s_cfg.ble_target_name, s_cfg.ble_target_addr);
+    ESP_LOGI(TAG, "config: transport=%s ap=%s ble=%s/%s lte=%s",
+             s_cfg.bms_transport, s_cfg.ap_ssid, s_cfg.ble_target_name,
+             s_cfg.ble_target_addr, s_cfg.lte_enable ? "on" : "off");
+    ESP_LOGI(TAG, "config: mqtt=%s broker=%s:%u prefix=%s 采样=%u ms × %u",
+             s_cfg.mqtt_enable ? "on" : "off",
+             s_cfg.mqtt_host[0] ? s_cfg.mqtt_host : "(none)",
+             (unsigned)s_cfg.mqtt_port, s_cfg.mqtt_prefix,
+             (unsigned)s_cfg.mqtt_sample_ms, (unsigned)s_cfg.mqtt_batch);
+    ESP_LOGI(TAG, "config: 4G apn=%s",
+             s_cfg.lte_apn[0] ? s_cfg.lte_apn : "(default)");
 }
 
 void app_config_get(app_config_t *out)
@@ -122,6 +192,17 @@ void app_config_save(const app_config_t *cfg)
     nvs_set_u32(h, "ble_scan", s_cfg.ble_scan_timeout_ms);
     nvs_set_u32(h, "ble_rec", s_cfg.ble_reconnect_ms);
     nvs_set_u32(h, "uart_poll", s_cfg.jk_uart_poll_ms);
+    nvs_set_u8(h, "lte_en", s_cfg.lte_enable ? 1 : 0);
+    nvs_set_str(h, "lte_apn", s_cfg.lte_apn);
+    nvs_set_u8(h, "mq_en", s_cfg.mqtt_enable ? 1 : 0);
+    nvs_set_str(h, "mq_host", s_cfg.mqtt_host);
+    nvs_set_u16(h, "mq_port", s_cfg.mqtt_port);
+    nvs_set_str(h, "mq_user", s_cfg.mqtt_user);
+    nvs_set_str(h, "mq_pass", s_cfg.mqtt_password);
+    nvs_set_str(h, "mq_pfx", s_cfg.mqtt_prefix);
+    nvs_set_u32(h, "mq_smpl", s_cfg.mqtt_sample_ms);
+    nvs_set_u8(h, "mq_batch", s_cfg.mqtt_batch);
+    nvs_set_u16(h, "mq_ka", s_cfg.mqtt_keepalive_s);
     nvs_set_i32(h, "log_level", s_cfg.log_level);
     nvs_set_u8(h, "led_enable", s_cfg.led_enable ? 1 : 0);
     nvs_commit(h);

@@ -404,6 +404,9 @@ static void render_ws2812_event(led_event_t ev)
         b = 0xFF; /* 蓝色：收到 485 查询 */
     } else if (ev == LED_EVENT_BMS) {
         g = 0xFF; /* 绿色：读取 BMS */
+    } else if (ev == LED_EVENT_LTE) {
+        g = 0xFF; /* 青色：4G 上报 */
+        b = 0xFF;
     }
     led_ws2812_write(g, r, b);
 }
@@ -451,7 +454,8 @@ static void render_fault_rgb(uint32_t faults, uint32_t tick)
     }
 }
 
-/* 单色 LED 只负责“任务成功”提示：平时熄灭，成功时点亮一下 */
+/* 单色 LED 只负责“任务成功”提示：平时熄灭，成功时点亮一下。
+ * 板上没有单色 LED（GPIO=-1）时，改由事件色补闪一次表达成功。 */
 static void render_status_on(void)
 {
     int gpio = CONFIG_JINJIAN_STATUS_LED_GPIO;
@@ -569,8 +573,15 @@ static void led_task(void *arg)
             case LED_PHASE_SUCCESS_BLINK:
                 if (faults != 0) {
                     render_fault_rgb(faults, tick);
-                } else {
+                } else if (CONFIG_JINJIAN_STATUS_LED_GPIO >= 0) {
+                    /* 有单色 LED：成功提示由它负责，RGB 恢复正常显示 */
                     render_ws2812_off();
+                } else if (phase_tick == 0) {
+                    /* 板上没有单色 LED：先灭一拍再用事件色补闪一次，
+                     * 于是“双闪=成功、单闪=失败”，反馈不丢失 */
+                    render_ws2812_off();
+                } else {
+                    render_ws2812_event(cur.ev);
                 }
                 render_status_on();
                 phase_tick++;

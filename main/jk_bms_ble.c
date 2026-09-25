@@ -315,17 +315,22 @@ static void decode_jk02_cell_info(const uint8_t *d, size_t len)
 
     uint32_t total_mv = u32le(d, 118 + shift);
     int32_t current_ma = s32le(d, 126 + shift);
-    int16_t temp1 = tenths_to_c((int16_t)u16le(d, 130 + shift));
-    int16_t temp2 = tenths_to_c((int16_t)u16le(d, 132 + shift));
+    int16_t temp1_raw = (int16_t)u16le(d, 130 + shift);
+    int16_t temp2_raw = (int16_t)u16le(d, 132 + shift);
+    int16_t temp1 = tenths_to_c(temp1_raw);
+    int16_t temp2 = tenths_to_c(temp2_raw);
     int16_t mos_raw = is_32s ? (int16_t)u16le(d, 112 + shift)
                              : (int16_t)u16le(d, 134 + shift);
     int16_t board_temp = tenths_to_c(mos_raw);
     uint32_t alarm = is_32s ? u32le(d, 134 + shift) : u16le(d, 136 + shift);
 
+    int16_t balan_current_ma = (int16_t)u16le(d, 138 + shift);
     uint8_t balance = d[140 + shift];
     uint8_t soc = d[141 + shift];
+    uint32_t cap_remain_mah = u32le(d, 142 + shift);
     uint32_t full_cap_mah = u32le(d, 146 + shift);
     uint32_t cycles = u32le(d, 150 + shift);
+    uint32_t cycle_cap_mah = u32le(d, 154 + shift);
     uint8_t soh = d[158 + shift];
     uint8_t charge_state = d[166 + shift];
     uint8_t discharge_state = d[167 + shift];
@@ -357,6 +362,7 @@ static void decode_jk02_cell_info(const uint8_t *d, size_t len)
     s_snapshot.poll_count++;
     s_snapshot.last_ok_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_snapshot.total_voltage_raw = clamp_u16(total_mv / 10);
+    s_snapshot.total_voltage_mv = total_mv;
     s_snapshot.cell_count = count;
     s_snapshot.soc = soc > 100 ? 100 : soc;
     s_snapshot.capacity_ah = capacity_ah;
@@ -366,9 +372,16 @@ static void decode_jk02_cell_info(const uint8_t *d, size_t len)
         current_ma = -32768;
     }
     s_snapshot.charge_current_raw = (int16_t)(current_ma / 10);
+    s_snapshot.charge_current_ma = current_ma;
     s_snapshot.temp1 = temp1;
     s_snapshot.temp2 = temp2;
     s_snapshot.board_temp = board_temp;
+    s_snapshot.temp1_tenths = temp1_raw;
+    s_snapshot.temp2_tenths = temp2_raw;
+    s_snapshot.board_temp_tenths = mos_raw;
+    s_snapshot.balan_current_ma = (uint16_t)balan_current_ma;
+    s_snapshot.capacity_remain_mah = (int32_t)cap_remain_mah;
+    s_snapshot.cycle_capacity_mah = cycle_cap_mah;
     memcpy(s_snapshot.cell_mv, cell_mv, sizeof(cell_mv));
     s_snapshot.max_cell_diff_mv = max_diff_mv(cell_mv, BMS_MAX_CELLS);
     s_snapshot.battery_type = battery_type;

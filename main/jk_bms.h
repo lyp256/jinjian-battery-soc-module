@@ -27,3 +27,10 @@ bool jk_bms_uart_get_snapshot(bms_snapshot_t *out);
 void jk_bms_uart_set_charge_time_min(uint16_t minutes);
 void jk_bms_uart_set_charge_target_soc(uint16_t soc);
 void jk_bms_uart_end_fast_charge(void);
+
+/* RPC（bms.readRegisters / writeRegisters / getParam / setParam）用的原始 Modbus 访问。
+ * 仅 UART(RS485) 通道可用；返回 0 成功，-1 失败并写入 err。 */
+int jk_bms_uart_read_regs(uint16_t start, uint16_t count, uint16_t *out,
+                          char *err, size_t err_cap);
+int jk_bms_uart_write_regs(uint16_t start, const uint16_t *vals, size_t count,
+                           char *err, size_t err_cap);

@@ -6,6 +6,7 @@
 typedef enum {
     LED_EVENT_485 = 0, /* 车端 485 总线收到查询：WS2812 蓝色闪烁 */
     LED_EVENT_BMS,     /* 读取 BMS 数据：WS2812 绿色闪烁 */
+    LED_EVENT_LTE,     /* 4G 模块上报数据：WS2812 青色闪烁 */
 } led_event_t;
 
 /* 初始化三个 LED 并启动状态灯任务。

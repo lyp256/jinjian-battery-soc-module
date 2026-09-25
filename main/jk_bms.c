@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -29,32 +30,42 @@ static const char *TAG = "jk_bms";
 #define JK_REG_DESIGN_CAP_CFG 0x107C
 #define JK_REG_RCV_TIME_CFG   0x1104
 
-/* 0x128A 起的统计块索引 */
+/* 0x128A 起的汇总状态块索引（单位：寄存器，1 下标 = 1 个 16bit 寄存器）。
+ * 地址对照 JK-BMS-RS485 V1.1 6.3 只读实时数据区：
+ *   0x128A TempMos / 0x1290 BatVol / 0x1298 BatCurrent / 0x129C-0x129E TempBat1-2 /
+ *   0x12A0 Alarm / 0x12A4 BalanCurrent / 0x12A6 BalanSta+SOC / 0x12A8 SOCCapRemain /
+ *   0x12AC SOCFullChargeCap / 0x12B0 SOCCycleCount / 0x12B4 SOCCycleCap /
+ *   0x12B8 SOCSOH+Precharge / 0x12BA UserAlarm / 0x12BC RunTime /
+ *   0x12C0 Charge+Discharge / 0x12C2 UserAlarm2 */
 #define STAT_TEMP_MOS      0
-#define STAT_BATVOL_HI     3
-#define STAT_BATVOL_LO     4
-#define STAT_CURRENT_HI    7
-#define STAT_CURRENT_LO    8
-#define STAT_TEMP_BAT1     9
-#define STAT_TEMP_BAT2     10
-#define STAT_ALARM_HI      11
-#define STAT_ALARM_LO      12
-#define STAT_BAL_SOC       14
-#define STAT_CAP_REM_HI    15
-#define STAT_CAP_REM_LO    16
-#define STAT_FULL_CAP_HI   17
-#define STAT_FULL_CAP_LO   18
-#define STAT_CYCLE_HI      19
-#define STAT_CYCLE_LO      20
-#define STAT_SOH_PREC      23
-#define STAT_USER_ALARM    24
-#define STAT_RUNTIME_HI    25
-#define STAT_RUNTIME_LO    26
-#define STAT_CHARGE_STATE  27
-#define STAT_USER_ALARM2   28
+#define STAT_BATVOL_HI     6
+#define STAT_BATVOL_LO     7
+#define STAT_CURRENT_HI    14
+#define STAT_CURRENT_LO    15
+#define STAT_TEMP_BAT1     18
+#define STAT_TEMP_BAT2     20
+#define STAT_ALARM_HI      22
+#define STAT_ALARM_LO      23
+#define STAT_BALAN_CURRENT 26
+#define STAT_BAL_SOC       28
+#define STAT_CAP_REM_HI    30
+#define STAT_CAP_REM_LO    31
+#define STAT_FULL_CAP_HI   34
+#define STAT_FULL_CAP_LO   35
+#define STAT_CYCLE_HI      38
+#define STAT_CYCLE_LO      39
+#define STAT_CYCLE_CAP_HI  42
+#define STAT_CYCLE_CAP_LO  43
+#define STAT_SOH_PREC      46
+#define STAT_USER_ALARM    48
+#define STAT_RUNTIME_HI    50
+#define STAT_RUNTIME_LO    51
+#define STAT_CHARGE_STATE  54
+#define STAT_USER_ALARM2   56
 
 static jk_bms_config_t s_cfg;
 static SemaphoreHandle_t s_mutex;
+static SemaphoreHandle_t s_bus_mutex;   /* 485 总线互斥：轮询任务与 RPC 用 */
 static bms_snapshot_t s_snapshot;
 
 static uint16_t s_design_cell_count;
@@ -97,6 +108,10 @@ static bool jk_read_regs(uint16_t addr, uint16_t num, uint16_t *regs, size_t max
         return false;
     }
 
+    if (s_bus_mutex != NULL) {
+        xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
+    }
+
     uint8_t frame[8];
     size_t frame_len = modbus_build_read_regs(frame, s_cfg.slave_addr, addr, num);
     uint8_t resp[256];
@@ -107,6 +122,9 @@ static bool jk_read_regs(uint16_t addr, uint16_t num, uint16_t *regs, size_t max
     int written = uart_write_bytes(s_cfg.uart_num, frame, frame_len);
     if (written != (int)frame_len) {
         ESP_LOGW(TAG, "JK write failed (%d)", written);
+        if (s_bus_mutex != NULL) {
+            xSemaphoreGive(s_bus_mutex);
+        }
         return false;
     }
 
@@ -126,6 +144,9 @@ static bool jk_read_regs(uint16_t addr, uint16_t num, uint16_t *regs, size_t max
         }
     }
 
+    if (s_bus_mutex != NULL) {
+        xSemaphoreGive(s_bus_mutex);
+    }
     if (got < 5 || !modbus_check_crc(resp, got)) {
         return false;
     }
@@ -284,7 +305,10 @@ static void apply_stats(const uint16_t *cells, size_t cell_n,
     int16_t temp2_raw = (int16_t)stats[STAT_TEMP_BAT2];
     int16_t temp_mos_raw = (int16_t)stats[STAT_TEMP_MOS];
     uint32_t alarm = u32_from(stats, STAT_ALARM_HI, STAT_ALARM_LO);
+    int16_t balan_current_ma = (int16_t)stats[STAT_BALAN_CURRENT];
     uint32_t full_cap_mah = u32_from(stats, STAT_FULL_CAP_HI, STAT_FULL_CAP_LO);
+    int32_t cap_remain_mah = s32_from(stats, STAT_CAP_REM_HI, STAT_CAP_REM_LO);
+    uint32_t cycle_cap_mah = u32_from(stats, STAT_CYCLE_CAP_HI, STAT_CYCLE_CAP_LO);
     uint32_t cycle_count = u32_from(stats, STAT_CYCLE_HI, STAT_CYCLE_LO);
     uint8_t balance = (uint8_t)(stats[STAT_BAL_SOC] >> 8);
     uint8_t soc = (uint8_t)(stats[STAT_BAL_SOC] & 0xFF);
@@ -340,13 +364,21 @@ static void apply_stats(const uint16_t *cells, size_t cell_n,
     s_snapshot.poll_count++;
     s_snapshot.last_ok_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_snapshot.total_voltage_raw = clamp_u16(voltage_raw);
+    s_snapshot.total_voltage_mv = bat_vol_mv;
     s_snapshot.cell_count = cell_count;
     s_snapshot.soc = soc > 100 ? 100 : soc;
     s_snapshot.capacity_ah = capacity_ah;
     s_snapshot.charge_current_raw = (int16_t)current_raw;
+    s_snapshot.charge_current_ma = current_ma;
     s_snapshot.temp1 = temp1;
     s_snapshot.temp2 = temp2;
     s_snapshot.board_temp = tenths_to_c(temp_mos_raw);
+    s_snapshot.temp1_tenths = temp1_raw;
+    s_snapshot.temp2_tenths = temp2_raw;
+    s_snapshot.board_temp_tenths = temp_mos_raw;
+    s_snapshot.balan_current_ma = (uint16_t)balan_current_ma;
+    s_snapshot.capacity_remain_mah = cap_remain_mah;
+    s_snapshot.cycle_capacity_mah = cycle_cap_mah;
     memcpy(s_snapshot.cell_mv, cells, cell_n * sizeof(uint16_t));
     if (cell_n < BMS_MAX_CELLS) {
         memset(s_snapshot.cell_mv + cell_n, 0,
@@ -425,12 +457,24 @@ int jk_bms_uart_init(void *config)
     const jk_bms_config_t *cfg = (const jk_bms_config_t *)config;
     s_cfg = *cfg;
     s_mutex = xSemaphoreCreateMutex();
+    s_bus_mutex = xSemaphoreCreateMutex();
     memset(&s_snapshot, 0, sizeof(s_snapshot));
     s_snapshot.charge_time_min = 60;
     s_snapshot.charge_target_soc = cfg->charge_target_soc;
     s_snapshot.version_regs[0] = 0x0100;
     bms_mac_pn(s_snapshot.pn, sizeof(s_snapshot.pn));
     s_charge_time_overridden = false;
+
+    /* 第一路 THVD1406DR 同样自动方向：初始化前先让 TX 保持空闲高电平 */
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << cfg->tx_gpio,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+    gpio_set_level(cfg->tx_gpio, 1);
 
     uart_config_t uart_cfg = {
         .baud_rate = cfg->baud_rate,
@@ -481,4 +525,67 @@ void jk_bms_uart_end_fast_charge(void)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_snapshot.fast_charging = 0;
     xSemaphoreGive(s_mutex);
+}
+
+/* ---------------- RPC 原始寄存器访问 ---------------- */
+
+int jk_bms_uart_read_regs(uint16_t start, uint16_t count, uint16_t *out,
+                          char *err, size_t err_cap)
+{
+    if (out == NULL || count == 0 || count > 64) {
+        snprintf(err, err_cap, "count 必须在 1..64");
+        return -1;
+    }
+    if (!jk_read_regs(start, count, out, count)) {
+        snprintf(err, err_cap, "Modbus 读 %u 个寄存器超时/校验失败", (unsigned)count);
+        return -1;
+    }
+    return 0;
+}
+
+int jk_bms_uart_write_regs(uint16_t start, const uint16_t *vals, size_t count,
+                           char *err, size_t err_cap)
+{
+    if (vals == NULL || count == 0 || count > 32) {
+        snprintf(err, err_cap, "count 必须在 1..32");
+        return -1;
+    }
+    uint8_t frame[7 + 32 * 2 + 2];
+    size_t len = modbus_build_write_regs(frame, s_cfg.slave_addr, start, vals, count);
+    if (len == 0) {
+        snprintf(err, err_cap, "组帧失败");
+        return -1;
+    }
+    if (s_bus_mutex != NULL) {
+        xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
+    }
+    uart_flush_input(s_cfg.uart_num);
+    int written = uart_write_bytes(s_cfg.uart_num, frame, len);
+    uint8_t resp[8];
+    size_t got = 0;
+    if (written == (int)len) {
+        while (got < sizeof(resp)) {
+            int n = uart_read_bytes(s_cfg.uart_num, resp + got,
+                                    (uint32_t)(sizeof(resp) - got),
+                                    pdMS_TO_TICKS(s_cfg.response_timeout_ms));
+            if (n <= 0) {
+                break;
+            }
+            got += (size_t)n;
+        }
+    }
+    if (s_bus_mutex != NULL) {
+        xSemaphoreGive(s_bus_mutex);
+    }
+    if (written != (int)len) {
+        snprintf(err, err_cap, "串口写入失败 (%d)", written);
+        return -1;
+    }
+    if (got < sizeof(resp) || !modbus_check_crc(resp, sizeof(resp)) ||
+        resp[1] != MODBUS_FUNC_WRITE_REGS || resp[0] != s_cfg.slave_addr) {
+        snprintf(err, err_cap, "写寄存器无有效响应（保护板可能拒绝该写入）");
+        return -1;
+    }
+    ESP_LOGI(TAG, "Modbus 写入 %u 个寄存器 @0x%04X 成功", (unsigned)count, start);
+    return 0;
 }

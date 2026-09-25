@@ -18,10 +18,14 @@
 #include "freertos/task.h"
 
 #include "app_config.h"
+#include "bms_uplink.h"
+#include "json_util.h"
 #include "jk_bms_ble.h"
 #include "log_stream.h"
+#include "ml307_4g.h"
 #include "ota_update.h"
 #include "power_mgr.h"
+#include "rpc_server.h"
 
 static const char *TAG = "web";
 static httpd_handle_t s_server;
@@ -190,7 +194,8 @@ static const char PAGE_HTML[] =
     "#logs{white-space:pre-wrap;background:#111;color:#8f8;font:12px monospace;padding:10px;max-height:260px;overflow:auto}"
     ".ok{color:#080}.bad{color:#c00}</style></head><body>"
     "<header>金箭 SOC 模块 · 配置与调试</header><main>"
-    "<div class='card'><h3>电池状态</h3><table id='status'></table></div>"
+    "<div class='card'><h3>设备与电池状态</h3><table id='devState'></table>"
+    "<table id='status'></table></div>"
     "<div class='card'><h3>配置</h3><form id='cfg'>"
     "<label>采集通道</label><select name='transport'><option value='uart'>UART (RS485)</option><option value='ble'>蓝牙 BLE</option></select>"
     "<label>热点 SSID</label><input name='apSsid' maxlength='32'>"
@@ -206,6 +211,36 @@ static const char PAGE_HTML[] =
     "<label>UART 轮询间隔(ms)</label><input name='uartPollMs' type='number' min='100' max='60000'>"
     "<label><input name='ledEnable' type='checkbox'> 启用 LED 指示灯</label>"
     "<br><button type='submit'>保存并重启</button></form></div>"
+    "<div class='card'><h3>4G / MQTT 上报 (ML307-NL)</h3><table id='lte'></table>"
+    "<form id='lteCfg'>"
+    "<label>4G 模块</label><select name='lteEnable'><option value='1'>启用</option><option value='0'>关闭</option></select>"
+    "<label>APN（留空 = 模块/SIM 默认）</label><input name='lteApn' maxlength='32'>"
+    "<label>MQTT 上报</label><select name='mqttEnable'><option value='1'>启用</option><option value='0'>关闭</option></select>"
+    "<label>MQTT broker（IP/域名，留空 = 不上报）</label><input name='mqttHost' maxlength='63'>"
+    "<label>MQTT 端口</label><input name='mqttPort' type='number' min='1' max='65535'>"
+    "<label>MQTT 用户名（留空 = 匿名）</label><input name='mqttUser' maxlength='32'>"
+    "<label>MQTT 密码</label><input name='mqttPassword' type='password' maxlength='32'>"
+    "<label>主题前缀</label><input name='mqttPrefix' maxlength='23'>"
+    "<label>采样周期(ms)</label><input name='mqttSampleMs' type='number' min='200' max='60000'>"
+    "<label>每批样本数</label><input name='mqttBatch' type='number' min='1' max='30'>"
+    "<label>MQTT 保活(s)</label><input name='mqttKeepaliveS' type='number' min='15' max='600'>"
+    "<br><button type='submit'>保存 4G/MQTT 配置并重启</button></form>"
+    "<label>AT 调试（EN=GPIO13 / TX=GPIO12 / RX=GPIO11）</label>"
+    "<input id='atCmd' value='AT+CSQ'>"
+    "<button onclick=\"sendAt()\">发送 AT</button>"
+    "<button onclick=\"doLte('publish')\">立即上报一批</button>"
+    "<button onclick=\"doLte('reconnect')\">重连</button>"
+    "<button onclick=\"doLte('powercycle')\">重启模块</button>"
+    "<pre id='atOut'></pre></div>"
+    "<div class='card'><h3>RPC 控制台（Web 与 MQTT 同一套方法）</h3>"
+    "<label>方法</label><select id='rpcMethod'>"
+    "<option>agent.ping</option><option>agent.getConfig</option><option>agent.setConfig</option>"
+    "<option>agent.reboot</option><option>bms.getState</option><option>bms.listParams</option>"
+    "<option>bms.getParam</option><option>bms.setParam</option>"
+    "<option>bms.readRegisters</option><option>bms.writeRegisters</option></select>"
+    "<label>params（JSON，可留空 {}）</label>"
+    "<textarea id='rpcParams' rows='3' style='width:100%'>{}</textarea>"
+    "<button onclick=\"sendRpc()\">发送</button><pre id='rpcOut'></pre></div>"
     "<div class='card'><h3>在线升级</h3>"
     "<input type='file' id='otaFile' accept='.bin'><br>"
     "<button onclick='doOta()'>上传并升级</button>"
@@ -234,6 +269,45 @@ static const char PAGE_HTML[] =
     "h+='<tr><td>运行时间</td><td>'+d.uptime+' s</td></tr>';"
     "h+='<tr><td>采集成功/失败</td><td>'+d.pollCount+' / '+d.pollFailures+'</td></tr>';"
     "document.getElementById('status').innerHTML=h}catch(e){}}"
+    "async function loadLte(){try{const d=await j('/api/4g/status');let h='';"
+    "h+='<tr><td>模块</td><td>'+(d.enabled?'已启用':'已关闭')+' · '+d.state+'</td></tr>';"
+    "h+='<tr><td>AT / SIM / 网络 / Socket</td><td>'+(d.atOk?'✓':'✗')+' '+(d.simOk?'✓':'✗')+' '+(d.netOk?'✓':'✗')+' '+(d.socketOk?'✓':'✗')+'</td></tr>';"
+    "h+='<tr><td>信号</td><td>CSQ '+d.csq+' ('+d.rssi+' dBm)</td></tr>';"
+    "h+='<tr><td>注册状态</td><td>'+d.regStat+'</td></tr>';"
+    "h+='<tr><td>IMEI / ICCID</td><td>'+d.imei+' / '+d.iccid+'</td></tr>';"
+    "h+='<tr><td>网络时间</td><td>'+(d.cclk||'—')+'</td></tr>';"
+    "h+='<tr><td>MQTT broker</td><td>'+(d.host?d.host+':'+d.port:'未配置')+'</td></tr>';"
+    "h+='<tr><td>MQTT 状态</td><td>'+(d.mqttConnected?'已连接':'未连接')+' · 下行订阅'+(d.subscribed?'✓':'✗')+'</td></tr>';"
+    "h+='<tr><td>设备 ID</td><td>'+d.deviceId+'</td></tr>';"
+    "h+='<tr><td>上报主题</td><td>'+(d.statusTopic||'—')+'</td></tr>';"
+    "h+='<tr><td>采样 / 批次成功失败</td><td>'+d.samples+' · '+d.batchesOk+' / '+d.batchesFail+'</td></tr>';"
+    "h+='<tr><td>最近报文</td><td>'+(d.lastPayloadSize||0)+' 字节, '+(d.lastPublishAgo>=0?d.lastPublishAgo+' s 前':'尚未上报')+'</td></tr>';"
+    "h+='<tr><td>透传收发</td><td>'+d.txBytes+' / '+d.rxBytes+' 字节</td></tr>';"
+    "h+='<tr><td>下行数据</td><td>'+(d.lastDownlink||'—')+'</td></tr>';"
+    "h+='<tr><td>最近错误</td><td>'+(d.uplinkError||d.lastError||'—')+'</td></tr>';"
+    "document.getElementById('lte').innerHTML=h}catch(e){}}"
+    "async function sendAt(){const c=document.getElementById('atCmd').value;"
+    "try{const d=await j('/api/4g/at',{method:'POST',headers:{'Content-Type':'application/json'},"
+    "body:JSON.stringify({cmd:c})});"
+    "document.getElementById('atOut').textContent=(d.ok?'OK':'FAIL')+'\\n'+(d.resp||d.error||'')}catch(e){}}"
+    "async function doLte(a){const d=await j('/api/4g/action',{method:'POST',"
+    "headers:{'Content-Type':'application/json'},body:JSON.stringify({action:a})});"
+    "alert(d.ok?('已下发: '+a):('失败: '+(d.error||'')))}"
+    "async function loadCfg(){try{const d=await j('/api/config');"
+    "async function sendRpc(){const m=document.getElementById('rpcMethod').value;"
+    "const p=document.getElementById('rpcParams').value||'{}';"
+    "const body='{\"jsonrpc\":\"2.0\",\"id\":\"web\",\"method\":\"'+m+'\",\"params\":'+p+'}';"
+    "try{const r=await fetch('/api/rpc',{method:'POST',headers:{'Content-Type':'application/json'},body});"
+    "document.getElementById('rpcOut').textContent=await r.text()}catch(e){"
+    "document.getElementById('rpcOut').textContent='请求失败'}}"
+    "async function loadState(){try{const d=await j('/api/state');let h='';"
+    "h+='<tr><td>设备 ID</td><td>'+(d.device?d.device.id:'—')+'</td></tr>';"
+    "h+='<tr><td>固件版本</td><td>'+(d.device?d.device.version:'—')+'</td></tr>';"
+    "h+='<tr><td>采集通道</td><td>'+(d.device?d.device.mode:'—')+'</td></tr>';"
+    "h+='<tr><td>运行时间</td><td>'+((d.device&&d.device.uptimeS)||0)+' s</td></tr>';"
+    "h+='<tr><td>4G 网络时间</td><td>'+((d.lte&&d.lte.timeValid)?d.lte.epoch:'未对时')+'</td></tr>';"
+    "h+='<tr><td>MQTT</td><td>'+((d.mqtt&&d.mqtt.connected)?'已连接':'未连接')+' · '+((d.mqtt&&d.mqtt.batchesOk)||0)+' 批</td></tr>';"
+    "document.getElementById('devState').innerHTML=h}catch(e){}}"
     "async function loadCfg(){try{const d=await j('/api/config');"
     "const f=document.getElementById('cfg');f.transport.value=d.transport;"
     "f.apSsid.value=d.apSsid;f.apPassword.value=d.apPassword;"
@@ -241,6 +315,12 @@ static const char PAGE_HTML[] =
     "f.bleProtocol.value=String(d.bleProtocol);f.blePollMs.value=d.blePollMs;"
     "f.bleScanTimeoutMs.value=d.bleScanTimeoutMs;f.bleReconnectMs.value=d.bleReconnectMs;"
     "f.uartPollMs.value=d.uartPollMs;f.ledEnable.checked=d.ledEnable===true}catch(e){}}"
+    "async function loadLteCfg(){try{const d=await j('/api/config');const f=document.getElementById('lteCfg');"
+    "f.lteEnable.value=d.lteEnable===true?'1':'0';f.lteApn.value=d.lteApn;"
+    "f.mqttEnable.value=d.mqttEnable===true?'1':'0';f.mqttHost.value=d.mqttHost;"
+    "f.mqttPort.value=d.mqttPort;f.mqttUser.value=d.mqttUser;f.mqttPassword.value=d.mqttPassword;"
+    "f.mqttPrefix.value=d.mqttPrefix;f.mqttSampleMs.value=d.mqttSampleMs;"
+    "f.mqttBatch.value=d.mqttBatch;f.mqttKeepaliveS.value=d.mqttKeepaliveS}catch(e){}}"
     "async function loadLevel(){try{const d=await j('/api/status');document.getElementById('logLevel').value=String(d.logLevel)}catch(e){}}"
     "async function startBleScan(){document.getElementById('bleScanState').textContent='扫描中…';await j('/api/ble/scan/start',{method:'POST'});pollBleResults()}"
     "async function pollBleResults(){const d=await j('/api/ble/scan/results');const sel=document.getElementById('bleDevices');"
@@ -276,7 +356,18 @@ static const char PAGE_HTML[] =
     "ledEnable:f.ledEnable.checked};"
     "const d=await j('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
     "alert(d.ok?'已保存，正在重启':'保存失败')};"
-    "loadStatus();loadCfg();loadLevel();startLogs();setInterval(loadStatus,2000);</script></body></html>";
+    "document.getElementById('lteCfg').onsubmit=async(e)=>{e.preventDefault();const f=e.target;"
+    "const body={lteEnable:f.lteEnable.value==='1',lteApn:f.lteApn.value,"
+    "mqttEnable:f.mqttEnable.value==='1',mqttHost:f.mqttHost.value,"
+    "mqttPort:Number(f.mqttPort.value),mqttUser:f.mqttUser.value,"
+    "mqttPassword:f.mqttPassword.value,mqttPrefix:f.mqttPrefix.value,"
+    "mqttSampleMs:Number(f.mqttSampleMs.value),mqttBatch:Number(f.mqttBatch.value),"
+    "mqttKeepaliveS:Number(f.mqttKeepaliveS.value)};"
+    "const d=await j('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});"
+    "alert(d.ok?'已保存，正在重启':'保存失败')};"
+    "loadStatus();loadCfg();loadLevel();loadLte();loadLteCfg();loadState();startLogs();"
+    "setInterval(loadStatus,2000);setInterval(loadLte,5000);setInterval(loadState,5000);"
+    "</script></body></html>";
 
 static void schedule_reboot(void)
 {
@@ -344,22 +435,36 @@ static esp_err_t handle_config_get(httpd_req_t *req)
 {
     app_config_t cfg;
     app_config_get(&cfg);
-    char t[16], s[40], p[96], bn[64], ba[64];
+    char t[16], s[40], p[96], bn[64], ba[64], apn[96];
+    char host[128], mu[96], mp[96], pfx[64];
     json_escape(cfg.bms_transport, t, sizeof(t));
     json_escape(cfg.ap_ssid, s, sizeof(s));
     json_escape(cfg.ap_password, p, sizeof(p));
     json_escape(cfg.ble_target_name, bn, sizeof(bn));
     json_escape(cfg.ble_target_addr, ba, sizeof(ba));
-    char buf[1024];
+    json_escape(cfg.lte_apn, apn, sizeof(apn));
+    json_escape(cfg.mqtt_host, host, sizeof(host));
+    json_escape(cfg.mqtt_user, mu, sizeof(mu));
+    json_escape(cfg.mqtt_password, mp, sizeof(mp));
+    json_escape(cfg.mqtt_prefix, pfx, sizeof(pfx));
+    char buf[1792];
     snprintf(buf, sizeof(buf),
              "{\"transport\":\"%s\",\"apSsid\":\"%s\",\"apPassword\":\"%s\","
              "\"bleName\":\"%s\",\"bleAddr\":\"%s\",\"bleProtocol\":%d,"
              "\"blePollMs\":%u,\"bleScanTimeoutMs\":%u,\"bleReconnectMs\":%u,"
-             "\"uartPollMs\":%u,\"logLevel\":%d,\"ledEnable\":%s}",
+             "\"uartPollMs\":%u,\"logLevel\":%d,\"ledEnable\":%s,"
+             "\"lteEnable\":%s,\"lteApn\":\"%s\","
+             "\"mqttEnable\":%s,\"mqttHost\":\"%s\",\"mqttPort\":%u,"
+             "\"mqttUser\":\"%s\",\"mqttPassword\":\"%s\",\"mqttPrefix\":\"%s\","
+             "\"mqttSampleMs\":%u,\"mqttBatch\":%u,\"mqttKeepaliveS\":%u}",
              t, s, p, bn, ba, cfg.ble_protocol,
              (unsigned)cfg.ble_poll_ms, (unsigned)cfg.ble_scan_timeout_ms,
              (unsigned)cfg.ble_reconnect_ms, (unsigned)cfg.jk_uart_poll_ms,
-             cfg.log_level, cfg.led_enable ? "true" : "false");
+             cfg.log_level, cfg.led_enable ? "true" : "false",
+             cfg.lte_enable ? "true" : "false", apn,
+             cfg.mqtt_enable ? "true" : "false", host, (unsigned)cfg.mqtt_port,
+             mu, mp, pfx, (unsigned)cfg.mqtt_sample_ms,
+             (unsigned)cfg.mqtt_batch, (unsigned)cfg.mqtt_keepalive_s);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
@@ -414,6 +519,57 @@ static esp_err_t handle_config_post(httpd_req_t *req)
     bool led = true;
     if (json_get_bool(buf, "ledEnable", &led)) {
         cfg.led_enable = led;
+    }
+    bool lte_en = true;
+    if (json_get_bool(buf, "lteEnable", &lte_en)) {
+        cfg.lte_enable = lte_en;
+    }
+    if (json_get_string(buf, "lteApn", tmp, sizeof(tmp))) {
+        copy_str(cfg.lte_apn, sizeof(cfg.lte_apn), tmp);
+    }
+    bool mqtt_en = true;
+    if (json_get_bool(buf, "mqttEnable", &mqtt_en)) {
+        cfg.mqtt_enable = mqtt_en;
+    }
+    if (json_get_string(buf, "mqttHost", tmp, sizeof(tmp))) {
+        copy_str(cfg.mqtt_host, sizeof(cfg.mqtt_host), tmp);
+    }
+    if (json_get_string(buf, "mqttUser", tmp, sizeof(tmp))) {
+        copy_str(cfg.mqtt_user, sizeof(cfg.mqtt_user), tmp);
+    }
+    if (json_get_string(buf, "mqttPassword", tmp, sizeof(tmp))) {
+        copy_str(cfg.mqtt_password, sizeof(cfg.mqtt_password), tmp);
+    }
+    if (json_get_string(buf, "mqttPrefix", tmp, sizeof(tmp))) {
+        copy_str(cfg.mqtt_prefix, sizeof(cfg.mqtt_prefix), tmp);
+    }
+    if (json_get_number(buf, "mqttPort", &num)) {
+        if (num < 1 || num > 65535) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mqttPort must be 1..65535");
+            return ESP_FAIL;
+        }
+        cfg.mqtt_port = (uint16_t)num;
+    }
+    if (json_get_number(buf, "mqttSampleMs", &num)) {
+        if (num < 200 || num > 60000) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mqttSampleMs must be 200..60000");
+            return ESP_FAIL;
+        }
+        cfg.mqtt_sample_ms = (uint32_t)num;
+    }
+    if (json_get_number(buf, "mqttBatch", &num)) {
+        if (num < 1 || num > 30) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mqttBatch must be 1..30");
+            return ESP_FAIL;
+        }
+        cfg.mqtt_batch = (uint8_t)num;
+    }
+    if (json_get_number(buf, "mqttKeepaliveS", &num)) {
+        if (num < 15 || num > 600) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mqttKeepaliveS must be 15..600");
+            return ESP_FAIL;
+        }
+        cfg.mqtt_keepalive_s = (uint16_t)num;
     }
 
     if (strcmp(cfg.bms_transport, "uart") != 0 && strcmp(cfg.bms_transport, "ble") != 0) {
@@ -517,6 +673,250 @@ static esp_err_t send_ota_error(httpd_req_t *req, const char *msg)
     return ESP_OK;
 }
 
+static esp_err_t send_json_error(httpd_req_t *req, int status, const char *msg)
+{
+    httpd_resp_set_status(req, status == 400 ? "400 Bad Request" : "500 Internal Server Error");
+    httpd_resp_set_type(req, "application/json");
+    char buf[160];
+    snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"%s\"}", msg);
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t handle_lte_status(httpd_req_t *req)
+{
+    ml307_4g_status_t st;
+    ml307_4g_get_status(&st);
+    bms_uplink_status_t up;
+    bms_uplink_get_status(&up);
+    app_config_t cfg;
+    app_config_get(&cfg);
+
+    char imei[64], iccid[64], cclk[64], host[160], dl[320], err[128];
+    char dev[64], topic[160], up_err[128];
+    json_escape(st.imei, imei, sizeof(imei));
+    json_escape(st.iccid, iccid, sizeof(iccid));
+    json_escape(st.cclk, cclk, sizeof(cclk));
+    json_escape(cfg.mqtt_host, host, sizeof(host));
+    json_escape(st.last_downlink, dl, sizeof(dl));
+    json_escape(st.last_error, err, sizeof(err));
+    json_escape(up.device_id, dev, sizeof(dev));
+    json_escape(up.status_topic, topic, sizeof(topic));
+    json_escape(up.last_error, up_err, sizeof(up_err));
+
+    long last_ok_ago = -1;
+    if (st.last_ok_ms != 0) {
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        last_ok_ago = (long)((now - st.last_ok_ms) / 1000);
+    }
+    long last_pub_ago = -1;
+    if (up.last_publish_ms != 0) {
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        last_pub_ago = (long)((now - up.last_publish_ms) / 1000);
+    }
+
+    char buf[1900];
+    snprintf(buf, sizeof(buf),
+             "{\"enabled\":%s,\"state\":\"%s\",\"atOk\":%s,\"simOk\":%s,"
+             "\"netOk\":%s,\"socketOk\":%s,\"csq\":%d,\"rssi\":%d,\"regStat\":%d,"
+             "\"imei\":\"%s\",\"iccid\":\"%s\",\"cclk\":\"%s\","
+             "\"host\":\"%s\",\"port\":%u,\"txBytes\":%u,\"rxBytes\":%u,"
+             "\"downlinkCount\":%u,\"atCmdCount\":%u,\"lastDownlink\":\"%s\","
+             "\"lastError\":\"%s\",\"lastOkAgo\":%ld,"
+             "\"uplinkEnabled\":%s,\"mqttConnected\":%s,\"subscribed\":%s,"
+             "\"deviceId\":\"%s\",\"statusTopic\":\"%s\",\"samples\":%u,"
+             "\"batchesOk\":%u,\"batchesFail\":%u,\"lastPayloadSize\":%u,"
+             "\"lastPublishAgo\":%ld,\"uplinkError\":\"%s\"}",
+             st.enabled ? "true" : "false",
+             st.state_name ? st.state_name : "unknown",
+             st.at_ok ? "true" : "false",
+             st.sim_ok ? "true" : "false",
+             st.net_ok ? "true" : "false",
+             st.socket_ok ? "true" : "false",
+             st.csq, st.rssi_dbm, st.reg_stat,
+             imei, iccid, cclk, host, (unsigned)cfg.mqtt_port,
+             (unsigned)st.tx_bytes, (unsigned)st.rx_bytes,
+             (unsigned)st.downlink_count, (unsigned)st.at_cmd_count,
+             dl, err, last_ok_ago,
+             up.enabled ? "true" : "false",
+             up.mqtt_connected ? "true" : "false",
+             up.subscribed ? "true" : "false",
+             dev, topic, (unsigned)up.samples,
+             (unsigned)up.batches_ok, (unsigned)up.batches_fail,
+             (unsigned)up.last_payload_size, last_pub_ago, up_err);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t handle_lte_action(httpd_req_t *req)
+{
+    char buf[256];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        return send_json_error(req, 400, "no body");
+    }
+    buf[len] = '\0';
+
+    char action[24];
+    if (!json_get_string(buf, "action", action, sizeof(action))) {
+        return send_json_error(req, 400, "missing action");
+    }
+    if (strcmp(action, "publish") == 0) {
+        bms_uplink_request_publish();
+    } else if (strcmp(action, "mqttreconnect") == 0) {
+        bms_uplink_request_reconnect();
+    } else if (strcmp(action, "reconnect") == 0) {
+        ml307_4g_request_reconnect();
+    } else if (strcmp(action, "powercycle") == 0) {
+        ml307_4g_request_power_cycle();
+    } else {
+        return send_json_error(req, 400,
+                               "action must be publish|mqttreconnect|reconnect|powercycle");
+    }
+    ESP_LOGI(TAG, "4G action: %s", action);
+    httpd_resp_set_type(req, "application/json");
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"action\":\"%s\"}", action);
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+static esp_err_t handle_lte_at(httpd_req_t *req)
+{
+    char buf[256];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        return send_json_error(req, 400, "no body");
+    }
+    buf[len] = '\0';
+
+    char cmd[128];
+    if (!json_get_string(buf, "cmd", cmd, sizeof(cmd))) {
+        return send_json_error(req, 400, "missing cmd");
+    }
+    if (strncmp(cmd, "AT", 2) != 0) {
+        return send_json_error(req, 400, "cmd must start with AT");
+    }
+    double tmo = 3000;
+    json_get_number(buf, "timeoutMs", &tmo);
+
+    char resp[400] = {0};
+    int rc = ml307_4g_at_command(cmd, resp, sizeof(resp), (uint32_t)tmo);
+    if (rc == -2) {
+        snprintf(resp, sizeof(resp), "(AT 通道忙，稍后重试)");
+    } else if (resp[0] == '\0') {
+        snprintf(resp, sizeof(resp), "(无响应)");
+    }
+    char esc[900];
+    json_escape(resp, esc, sizeof(esc));
+    char out[1024];
+    snprintf(out, sizeof(out), "{\"ok\":%s,\"rc\":%d,\"resp\":\"%s\"}",
+             rc == 0 ? "true" : "false", rc, esc);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, out);
+    return ESP_OK;
+}
+
+/* Web 侧 RPC：与 MQTT 下行共用 rpc_server 分发 */
+static esp_err_t handle_rpc_post(httpd_req_t *req)
+{
+    static char body[1536];
+    static char resp[RPC_RESPONSE_MAX];
+
+    int len = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (len <= 0) {
+        return send_json_error(req, 400, "no body");
+    }
+    body[len] = '\0';
+
+    int n = rpc_server_handle(body, (size_t)len, resp, sizeof(resp));
+    if (n < 0) {
+        return send_json_error(req, 500, "rpc failed");
+    }
+    httpd_resp_set_type(req, "application/json");
+    if (n == 0) {
+        httpd_resp_sendstr(req, "{\"ok\":true,\"notification\":true}");
+        return ESP_OK;
+    }
+    return httpd_resp_send(req, resp, (size_t)n);
+}
+
+/* 结构化状态：device/config（RPC 层）+ battery/lte/mqtt 分节 */
+static esp_err_t handle_state_get(httpd_req_t *req)
+{
+    static char base[1024];
+    static char buf[3072];
+
+    bms_snapshot_t snap;
+    bool have = bms_manager_get_snapshot(&snap);
+    ml307_4g_status_t lte;
+    ml307_4g_get_status(&lte);
+    bms_uplink_status_t up;
+    bms_uplink_get_status(&up);
+
+    if (rpc_server_device_state_json(base, sizeof(base)) < 0) {
+        snprintf(base, sizeof(base), "{}");
+    }
+    size_t blen = strlen(base);
+
+    sbuf_t sb;
+    sb_init(&sb, buf, sizeof(buf));
+    sb_puts(&sb, "{");
+    if (blen >= 4 && base[0] == '{' && base[blen - 1] == '}') {
+        sb_printf(&sb, "%.*s,", (int)(blen - 2), base + 1);
+    }
+    sb_printf(&sb, "\"battery\":{\"haveData\":%s,\"fresh\":%s,\"soc\":%u,"
+                   "\"voltageMv\":%u,\"currentMa\":%ld,\"cellCount\":%u,"
+                   "\"capacityAh\":%u,\"temp1\":%d,\"temp2\":%d,\"boardTemp\":%d,"
+                   "\"cycleCount\":%u,\"fastCharging\":%u,"
+                   "\"protections\":[%u,%u,%u,%u,%u],\"pollCount\":%u,"
+                   "\"pollFailures\":%u,\"driver\":",
+             (have && snap.have_data) ? "true" : "false",
+             (have && snap.fresh) ? "true" : "false",
+             (unsigned)snap.soc, (unsigned)snap.total_voltage_mv,
+             (long)snap.charge_current_ma, (unsigned)snap.cell_count,
+             (unsigned)snap.capacity_ah, snap.temp1, snap.temp2, snap.board_temp,
+             (unsigned)snap.cycle_count, (unsigned)snap.fast_charging,
+             snap.protection[0], snap.protection[1], snap.protection[2],
+             snap.protection[3], snap.protection[4],
+             (unsigned)snap.poll_count, (unsigned)snap.poll_failures);
+    sb_json_quoted(&sb, bms_manager_name());
+    sb_puts(&sb, "}");
+
+    sb_printf(&sb, ",\"lte\":{\"enabled\":%s,\"state\":", lte.enabled ? "true" : "false");
+    sb_json_quoted(&sb, lte.state_name ? lte.state_name : "unknown");
+    sb_printf(&sb, ",\"atOk\":%s,\"simOk\":%s,\"netOk\":%s,\"socketOk\":%s,"
+                   "\"csq\":%d,\"rssi\":%d,\"imei\":",
+              lte.at_ok ? "true" : "false", lte.sim_ok ? "true" : "false",
+              lte.net_ok ? "true" : "false", lte.socket_ok ? "true" : "false",
+              lte.csq, lte.rssi_dbm);
+    sb_json_quoted(&sb, lte.imei);
+    sb_puts(&sb, ",\"iccid\":");
+    sb_json_quoted(&sb, lte.iccid);
+    sb_printf(&sb, ",\"timeValid\":%s,\"epoch\":%u,\"txBytes\":%u,\"rxBytes\":%u}",
+              lte.time_valid ? "true" : "false", (unsigned)lte.unix_time,
+              (unsigned)lte.tx_bytes, (unsigned)lte.rx_bytes);
+
+    sb_printf(&sb, ",\"mqtt\":{\"enabled\":%s,\"connected\":%s,\"subscribed\":%s,"
+                   "\"deviceId\":",
+              up.enabled ? "true" : "false", up.mqtt_connected ? "true" : "false",
+              up.subscribed ? "true" : "false");
+    sb_json_quoted(&sb, up.device_id);
+    sb_puts(&sb, ",\"statusTopic\":");
+    sb_json_quoted(&sb, up.status_topic);
+    sb_printf(&sb, ",\"samples\":%u,\"batchesOk\":%u,\"batchesFail\":%u,"
+                   "\"lastPayloadSize\":%u,\"downlinkCount\":%u,\"lastError\":",
+              (unsigned)up.samples, (unsigned)up.batches_ok,
+              (unsigned)up.batches_fail, (unsigned)up.last_payload_size,
+              (unsigned)up.downlink_count);
+    sb_json_quoted(&sb, up.last_error);
+    sb_puts(&sb, "}}");
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, buf, sb.len);
+}
+
 static esp_err_t handle_ota_post(httpd_req_t *req)
 {
     if (ota_update_active()) {
@@ -610,7 +1010,7 @@ void web_server_start(void)
     start_softap();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192;
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 17;
     cfg.recv_wait_timeout = 60;
     cfg.send_wait_timeout = 60;
     if (httpd_start(&s_server, &cfg) == ESP_OK) {
@@ -624,6 +1024,11 @@ void web_server_start(void)
             {.uri = "/api/ota", .method = HTTP_POST, .handler = handle_ota_post},
             {.uri = "/api/ble/scan/start", .method = HTTP_POST, .handler = handle_ble_scan_start},
             {.uri = "/api/ble/scan/results", .method = HTTP_GET, .handler = handle_ble_scan_results},
+            {.uri = "/api/4g/status", .method = HTTP_GET, .handler = handle_lte_status},
+            {.uri = "/api/4g/action", .method = HTTP_POST, .handler = handle_lte_action},
+            {.uri = "/api/4g/at", .method = HTTP_POST, .handler = handle_lte_at},
+            {.uri = "/api/rpc", .method = HTTP_POST, .handler = handle_rpc_post},
+            {.uri = "/api/state", .method = HTTP_GET, .handler = handle_state_get},
         };
         for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
             httpd_register_uri_handler(s_server, &uris[i]);

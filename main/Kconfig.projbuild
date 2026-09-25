@@ -3,21 +3,21 @@ menu "Jinjian Battery SOC Module"
     config JINJIAN_JK_UART_NUM
         int "Jikong BMS UART number"
         default 0
-        range 0 1
+        range 0 2
         help
-            ESP32 UART peripheral connected to the Jikong BMS.
+            ESP32-S3 UART peripheral connected to the Jikong BMS.
 
     config JINJIAN_JK_TX_GPIO
         int "Jikong BMS TX GPIO"
-        default 4
+        default 2
         help
-            ESP32-C6 GPIO used as UART TX to the Jikong BMS.
+            第一路 RS485（THVD1406DR）的 D 脚：ESP32-S3 的 UART TX。
 
     config JINJIAN_JK_RX_GPIO
         int "Jikong BMS RX GPIO"
-        default 5
+        default 1
         help
-            ESP32-C6 GPIO used as UART RX from the Jikong BMS.
+            第一路 RS485（THVD1406DR）的 R 脚：ESP32-S3 的 UART RX。
 
     config JINJIAN_JK_BAUD
         int "Jikong BMS baud rate"
@@ -80,27 +80,21 @@ menu "Jinjian Battery SOC Module"
     config JINJIAN_VEH_UART_NUM
         int "Vehicle RS485 UART number"
         default 1
-        range 0 1
+        range 0 2
         help
-            ESP32 UART peripheral connected to MAX3485 / vehicle RS485.
+            ESP32-S3 UART peripheral connected to the vehicle RS485 bus.
 
     config JINJIAN_VEH_TX_GPIO
         int "Vehicle RS485 TX GPIO"
-        default 16
+        default 4
         help
-            ESP32-C6 GPIO used as RS485 UART TX.
+            第二路 RS485（THVD1406DR）的 D 脚：ESP32-S3 的 UART TX。
 
     config JINJIAN_VEH_RX_GPIO
         int "Vehicle RS485 RX GPIO"
-        default 17
+        default 3
         help
-            ESP32-C6 GPIO used as RS485 UART RX.
-
-    config JINJIAN_VEH_DE_GPIO
-        int "MAX3485 DE/RE GPIO"
-        default 6
-        help
-            GPIO wired to the MAX3485 DE/RE pins (RTS direction control).
+            第二路 RS485（THVD1406DR）的 R 脚：ESP32-S3 的 UART RX。
 
     config JINJIAN_VEH_BAUD
         int "Vehicle RS485 baud rate"
@@ -114,6 +108,124 @@ menu "Jinjian Battery SOC Module"
         range 1 247
         help
             Address the module answers on the Jinjian BMS bus.
+
+    config JINJIAN_LTE_ENABLE
+        bool "Enable ML307 4G (LTE) module"
+        default y
+        help
+            启用 ML307-NL 4G 模块（AT 指令）。模块上电入网后建立到 MQTT broker
+            的 TCP 连接，采集数据按 BMSStateHistory 压缩格式上报（见 README
+            「MQTT 上报」）。可在 Web 页面“4G / MQTT 上报”里修改并保存。
+
+    config JINJIAN_LTE_UART_NUM
+        int "4G module UART number"
+        default 2
+        range 0 2
+        help
+            ESP32-S3 UART peripheral connected to the ML307 module.
+
+    config JINJIAN_LTE_TX_GPIO
+        int "4G module ESP TX GPIO"
+        default 12
+        help
+            ESP32-S3 GPIO → ML307 模块 RX（模块接收脚）。
+
+    config JINJIAN_LTE_RX_GPIO
+        int "4G module ESP RX GPIO"
+        default 11
+        help
+            ESP32-S3 GPIO ← ML307 模块 TX（模块发送脚）。
+
+    config JINJIAN_LTE_EN_GPIO
+        int "4G module EN / PWR_ON GPIO"
+        default 13
+        range -1 48
+        help
+            ML307 EN（PWR_ON/OFF）控制脚；-1 表示由硬件常开，固件不控制。
+
+    config JINJIAN_LTE_EN_ACTIVE_LOW
+        bool "4G EN is active low"
+        default y
+        help
+            ML307 PWR_ON/OFF 低电平有效，默认勾选。若板上 EN 是高电平使能的
+            电源开关，取消勾选。
+
+    config JINJIAN_LTE_EN_PULSE_MS
+        int "4G EN pulse width (ms, 0 = level enable)"
+        default 2000
+        range 0 10000
+        help
+            >0：按 PWR_ON/OFF 按键方式，先输出有效电平 JINJIAN_LTE_EN_PULSE_MS
+            毫秒再释放（ML307 开机需 ≥1.5s）；
+            0：保持有效电平不变（EN 直接使能电源开关）。
+
+    config JINJIAN_LTE_BAUD
+        int "4G module baud rate"
+        default 115200
+        help
+            ML307 AT 口波特率，默认 115200 8N1。
+
+    config JINJIAN_LTE_APN
+        string "4G APN (empty = module default)"
+        default ""
+        help
+            留空使用模块/SIM 默认 APN；填写后开机流程会先执行
+            AT+CGDCONT 与 AT+MIPCALL 激活 PDP。
+
+    config JINJIAN_MQTT_ENABLE
+        bool "Enable MQTT uplink (BMSStateHistory)"
+        default y
+        help
+            启用采集上报：采样电池数据 → 压缩编码 → MQTT 发布。
+
+    config JINJIAN_MQTT_BROKER_HOST
+        string "MQTT broker host or IP"
+        default "399.run"
+        help
+            MQTT broker 域名或 IP（4G 模块的 TCP 目标）。留空则只入网不上报。
+
+    config JINJIAN_MQTT_BROKER_PORT
+        int "MQTT broker port"
+        default 1883
+        range 1 65535
+
+    config JINJIAN_MQTT_USERNAME
+        string "MQTT username (empty = anonymous)"
+        default "mqtt"
+
+    config JINJIAN_MQTT_PASSWORD
+        string "MQTT password"
+        default "test"
+
+    config JINJIAN_MQTT_TOPIC_PREFIX
+        string "MQTT topic prefix"
+        default "/bms"
+        help
+            主题前缀，实际使用 <prefix>/<device_id>/status（上报）、
+            <prefix>/<device_id>/call（下行）、<prefix>/<device_id>/reply（回复）。
+            device_id 优先取 4G 模块 IMEI，取不到时回退本机 PN。
+
+    config JINJIAN_MQTT_SAMPLE_INTERVAL_MS
+        int "BMS sample interval (ms)"
+        default 1000
+        range 200 60000
+        help
+            采样周期，默认每秒 1 条（与 mqttagent 一致）。
+
+    config JINJIAN_MQTT_BATCH_SAMPLES
+        int "Samples per MQTT batch"
+        default 30
+        range 1 30
+        help
+            每批样本数，攒满后编码成一条 BMSStateHistory 报文发布；
+            默认 30 条（1 秒采样时约 30 秒一包）。
+
+    config JINJIAN_MQTT_KEEPALIVE_S
+        int "MQTT keepalive (s)"
+        default 60
+        range 15 600
+        help
+            MQTT 保活周期，实际按一半时间发送 PINGREQ。
 
     config JINJIAN_BMS_TRANSPORT
         string "Default BMS transport"
@@ -201,7 +313,7 @@ menu "Jinjian Battery SOC Module"
     config JINJIAN_PWR_LED_GPIO
         int "Power LED GPIO (-1 = hardwired)"
         default -1
-        range -1 30
+        range -1 48
         help
             电源 LED 所在的 GPIO。若电源 LED 是硬接电源（不受 MCU 控制），
             保持 -1；配置为具体引脚后，固件会让它常亮（LED 总开关关闭时熄灭）。
@@ -214,10 +326,11 @@ menu "Jinjian Battery SOC Module"
 
     config JINJIAN_STATUS_LED_GPIO
         int "Status LED GPIO"
-        default 15
-        range -1 30
+        default -1
+        range -1 48
         help
-            GPIO15 单色状态 LED；-1 表示未接。
+            单色状态 LED（任务成功提示）。本板（ESP32-S3）只焊了一颗 WS2812、
+            没有单色 LED，默认 -1 表示未接；接了就填对应 GPIO。
 
     config JINJIAN_STATUS_LED_ACTIVE_LOW
         bool "Status LED is active low"
@@ -227,10 +340,10 @@ menu "Jinjian Battery SOC Module"
 
     config JINJIAN_WS2812_GPIO
         int "WS2812 RGB LED GPIO"
-        default 8
-        range -1 30
+        default 48
+        range -1 48
         help
-            WS2812 数据脚（默认 GPIO8）；-1 表示未接。
+            WS2812 数据脚（本板为 GPIO48）；-1 表示未接。
 
     config JINJIAN_WS2812_LED_COUNT
         int "WS2812 LED count"
@@ -241,10 +354,10 @@ menu "Jinjian Battery SOC Module"
 
     config JINJIAN_FACTORY_RESET_GPIO
         int "Factory reset BOOT GPIO"
-        default 9
-        range 0 30
+        default 0
+        range 0 48
         help
-            BOOT 键 GPIO（ESP32-C6 开发板通常为 GPIO9）。
+            BOOT 键 GPIO（ESP32-S3 开发板为 GPIO0）。
             启动时按住超过 JINJIAN_FACTORY_RESET_HOLD_MS 会清空配置并重启。
 
     config JINJIAN_FACTORY_RESET_ACTIVE_LOW
