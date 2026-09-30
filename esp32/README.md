@@ -17,7 +17,7 @@
                       (极空 Modbus)                                   └─ 极空 BLE（可选）
 ```
 
-4G 侧的上报链路移植自 `mqttagent`（Air780E/LuatOS）：每秒采样一条电池数据，
+4G 侧的上报链路移植自 mqttagent（Air780E/LuatOS）：每秒采样一条电池数据，
 攒满 30 条按 **BMSStateHistory** 压缩格式打包，经 MQTT 上报给 Go agent →
 VictoriaMetrics；编码与服务端字节级兼容（见「MQTT 采集上报」）。
 
@@ -52,8 +52,7 @@ THVD1406DR 是**自动方向**收发器，没有 DE 控制脚，固件按普通 
 ## 构建与烧录
 
 ```powershell
-# 激活本机 ESP-IDF 6.1 环境
-. C:\Espressif\tools\Microsoft.v6.1.PowerShell_profile.ps1
+# 激活 ESP-IDF 6.1 环境（按本机安装路径执行 export.ps1 / profile）
 
 idf.py set-target esp32s3
 idf.py build
@@ -94,7 +93,7 @@ main/
 
 ```text
 tools/
-├── golden_gen.lua    # 用 mqttagent 参考实现生成编码黄金向量
+├── golden_gen.lua    # 生成编码黄金向量
 ├── golden_vectors.h  # 生成的向量（golden1/golden2/active30/fake30）
 └── bms_hist_test.c   # 编码器离线比对测试（WSL/Linux: gcc tools/bms_hist_test.c main/bms_hist.c）
 ```
@@ -110,14 +109,13 @@ tools/
 `bms_manager_set_driver()` 选择当前采集通道，金箭从机和 Web 页面只读统一快照，
 后续接入其它保护板只需再实现一个 `bms_driver_t`。
 
-> **本次同时修正了 `jk_bms.c` 汇总区寄存器下标**：原实现把「字节偏移」当成
-> 「寄存器下标」使用，总电压/电流/温度/报警/SOC/容量等会整体读错寄存器。
-> 现在按 JK-BMS-RS485 V1.1 §6.3 取值：TempMos `0x128A`、BatVol `0x1290`、
+> **`jk_bms.c` 汇总区寄存器下标**（按 JK-BMS-RS485 V1.1 §6.3 取值）：
+> TempMos `0x128A`、BatVol `0x1290`、
 > BatCurrent `0x1298`、TempBat1/2 `0x129C/0x129E`、Alarm `0x12A0`、
 > BalanCurrent `0x12A4`、BalanSta+SOC `0x12A6`、SOCCapRemain `0x12A8`、
 > SOCFullChargeCap `0x12AC`、SOCCycleCount `0x12B0`、SOCCycleCap `0x12B4`、
 > SOCSOH `0x12B8`、RunTime `0x12BC`、Charge/Discharge `0x12C0`、UserAlarm2 `0x12C2`。
-> 快照相应新增 `total_voltage_mv` / `charge_current_ma` / `temp*_tenths` /
+> 快照含 `total_voltage_mv` / `charge_current_ma` / `temp*_tenths` /
 > `balan_current_ma` / `capacity_remain_mah` / `cycle_capacity_mah`（UART 与 BLE
 > 驱动都会填充），供 MQTT 上报使用。
 
@@ -194,9 +192,9 @@ tools/
 | `/api/4g/action` | POST | `{"action":"publish"｜"mqttreconnect"｜"reconnect"｜"powercycle"}` |
 | `/api/4g/at` | POST | `{"cmd":"AT+CSQ","timeoutMs":3000}` 手动下发 AT 指令 |
 
-## MQTT 采集上报（移植自 mqttagent）
+## MQTT 采集上报
 
-上报链路从原来的 Air780E/LuatOS 固件（`mqttagent/air780e`）移植到本模块，
+上报链路移植自 mqttagent（Air780E/LuatOS），
 **主题、BMSStateHistory 编码、QoS 与 Go 服务端保持一致**，现有 agent 与看板无需改动：
 
 ```
@@ -222,18 +220,18 @@ EN 脉冲上电 → AT 应答（最多 45s）→ ATE0/AT+CGSN/AT+ICCID（可选 
 → 周期 MIPSEND 发布批次；掉线自动重连，AT 无响应则按 EN 断电重开机
 ```
 
-- `device_id` 优先取 4G 模块 **IMEI**（等价 mqttagent 的 `mobile.imei()`），
+- `device_id` 优先取 4G 模块 **IMEI**，
   未读到前先用本机 PN（`SOC-xxxxxxxxxxxx`）占位，读到后自动切换；
 - 主题：上报 `<prefix>/<device>/status`，下行订阅 `<prefix>/<device>/call`，
   回复 `<prefix>/<device>/reply`（JSON-RPC 方法分发尚未移植，收到下行只记录日志，
   并显示在 Web 状态页“下行数据”一行）；
 - 时间戳：取 ML307 网络时间（`AT+CCLK?`），每小时重新对齐；未对时前用开机秒数占位；
-- 编码列（对应 `mqttagent/docs/bms.md`）：temp1/temp2/tempMos（0.1℃）、
+- 编码列：temp1/temp2/tempMos（0.1℃）、
   balanCurrent（mA）、batVol（mV）、batCurrent（mA）、socCycleCap（mAh）、
   socCapRemain（mAh）、time（Unix 秒）与电芯电压列（offset/spatial 两种布局取较短者）；
-- 默认 1 秒 × 30 条 ≈ 30 秒一包、QoS0，与 mqttagent 默认参数一致；
+- 默认 1 秒 × 30 条 ≈ 30 秒一包、QoS0；
 - 保活：每 keepalive/2 秒发 PINGREQ；socket 断开或连续 3 次发布失败即重连；
-- 编码器已用 mqttagent 的黄金向量做字节级回归（见 `tools/`）：
+- 编码器已用黄金向量做字节级回归（见 `tools/`）：
   golden1 41B、golden2 30B、active30 421B、fake30 420B 全部一致。
 
 Web 页面“4G / MQTT 上报”卡片提供：4G 状态机、信号强度、IMEI/ICCID、MQTT 连接与
