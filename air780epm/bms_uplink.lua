@@ -17,6 +17,12 @@
         ▼
   MQTT PUBLISH(QoS0) → <prefix>/<device_id>/status
 
+上报与采集解耦：除"攒满一批立即上报"外，另有 REPORT_PERIOD_MS（默认 30s）
+  定时冲刷——无论极空是否采集到数据都上报：
+    · 周期内有真实样本 → 按实际条数上报（可不足 BATCH_SAMPLES）；
+    · 周期内完全没有极空数据 → 用兜底样本填满一批后上报
+      （REPORT_HOLD_LAST=true 沿用最近一次极空快照，false 则全 0）。
+
 上报主题：<MQTT_TOPIC_PREFIX>/<IMEI>/status。
 
 4G 上报开关：config.MQTT_HOST 留空（nil 或 ""）表示本机不用 4G 上报，
@@ -83,7 +89,8 @@ local hist_index = 0
 local batch_cell_count = 0 -- 当前批次固定的串数
 
 local stats = {
-    samples = 0,
+    samples = 0,        -- 真实采集样本数（一轮极空广播 = 一条）
+    placeholders = 0,   -- 无采集数据时用兜底值填充的样本数
     batches = 0,
     published = 0,
     dropped = 0,
@@ -158,14 +165,20 @@ end
 
 --=============================================================================
 -- 采样：一轮广播 = 一条样本
+--   上报与采集解耦：由 task_report 按 REPORT_PERIOD_MS 定时冲刷，
+--   采集不到数据时用兜底样本补齐，保证"无论采集成功与否都按时上报"。
 --=============================================================================
-local function snapshot_and_notify()
+local function snapshot_and_notify(n)
+    n = n or ring.count
+    if n < 1 then
+        return
+    end
     hist_index = (hist_index % 2) + 1
     local h = hists[hist_index]
     local C = batch_cell_count
-    h.count = BATCH
+    h.count = n
     h.cellCount = C
-    for i = 1, BATCH do
+    for i = 1, n do
         h.time[i] = ring.time[i]
         h.temp1[i] = ring.temp1[i]
         h.temp2[i] = ring.temp2[i]
@@ -182,14 +195,20 @@ local function snapshot_and_notify()
     end
     ring.count = 0
     stats.batches = stats.batches + 1
-    d_info("batch ready", stats.batches, "samples", BATCH, "cells", C)
+    d_info("batch ready", stats.batches, "samples", n, "cells", C)
     sys.publish("BMS_BATCH_READY", hist_index)
 end
 
-local function add_sample(s)
-    local C = cfg.CELL_COUNT > 0 and cfg.CELL_COUNT or s.cellCount
-    if C <= 0 then
-        return
+-- is_fallback = true 表示本条没有新采集数据（兜底值），单独计数且不改批次串数
+local function add_sample(s, is_fallback)
+    local C
+    if is_fallback and batch_cell_count > 0 then
+        C = batch_cell_count   -- 兜底样本沿用当前批次串数，避免打断已有批次
+    else
+        C = cfg.CELL_COUNT > 0 and cfg.CELL_COUNT or s.cellCount
+    end
+    if C < 0 then
+        C = 0
     end
     if C > jk.MAX_CELLS then
         C = jk.MAX_CELLS
@@ -218,11 +237,47 @@ local function add_sample(s)
         ring.cellVols[base + j] = s.cells[j] or 0
     end
     ring.count = pos
-    stats.samples = stats.samples + 1
+    if is_fallback then
+        stats.placeholders = stats.placeholders + 1
+    else
+        stats.samples = stats.samples + 1
+    end
 
     if ring.count >= BATCH then
-        snapshot_and_notify()
+        snapshot_and_notify(BATCH)
     end
+end
+
+-- 兜底样本：默认沿用最近一次极空快照（保持数值连续），从未收到过则全 0；
+-- 时间戳用当前时间，保证上报时间轴连续。
+local function fallback_sample(ts)
+    local s = jk.get_state()
+    if cfg.REPORT_HOLD_LAST ~= false and s and s.cellCount and s.cellCount > 0 then
+        return {
+            ts = ts,
+            cellCount = s.cellCount,
+            cells = s.cells,
+            batVolMv = s.batVolMv,
+            batCurrentMa = s.batCurrentMa,
+            soc = s.soc,
+            tempBatC = s.tempBatC,
+            tempMosC = s.tempMosC,
+            fullCapMah = s.fullCapMah or 0,
+            capRemainMah = s.capRemainMah or 0,
+        }
+    end
+    return {
+        ts = ts,
+        cellCount = 0,
+        cells = {},
+        batVolMv = 0,
+        batCurrentMa = 0,
+        soc = 0,
+        tempBatC = 0,
+        tempMosC = 0,
+        fullCapMah = 0,
+        capRemainMah = 0,
+    }
 end
 
 -- 采样任务：首样本前等待 NTP 对时（最多 60s），保证 Time 列准确
@@ -232,6 +287,26 @@ local function task_sample()
         local ok, s = sys.waitUntil("JK_ROUND")
         if ok and s then
             add_sample(s)
+        end
+    end
+end
+
+-- 上报任务：与采集解耦，无论是否采集到数据，每个 REPORT_PERIOD_MS 都冲刷/上报一次
+--   ring 里有真实样本 → 按实际条数上报（可不足 BATCH_SAMPLES）；
+--   ring 为空（整个周期没有极空数据）→ 用兜底样本填满一批后上报。
+local function task_report()
+    local period_ms = cfg.REPORT_PERIOD_MS or 30000
+    local step_s = math.max(1, math.floor(period_ms / BATCH / 1000))
+    while true do
+        sys.wait(period_ms)
+        if ring.count > 0 then
+            snapshot_and_notify(ring.count)
+        else
+            d_warn("no collection data, report fallback batch")
+            local now = os.time()
+            for i = 1, BATCH do
+                add_sample(fallback_sample(now - (BATCH - i) * step_s), true)
+            end
         end
     end
 end
@@ -267,23 +342,12 @@ local function task_publish()
     end
 end
 
--- 周期状态日志（便于现场观察采集/上报是否正常）
-sys.taskInit(function()
-    while true do
-        sys.wait(60000)
-        local jks = jk.get_stats()
-        d_info("status", "rounds", jks.rounds, "samples", stats.samples,
-            "batches", stats.batches, "published", stats.published,
-            "dropped", stats.dropped,
-            "mqtt", (not MQTT_ENABLE) and "disabled" or (mqtt_ready and "up" or "down"))
-    end
-end)
-
 --=============================================================================
 -- 启动
 --=============================================================================
 if MQTT_ENABLE then
     sys.taskInit(task_sample)
+    sys.taskInit(task_report)
     sys.taskInit(task_publish)
     sys.taskInit(connect_mqtt)
 else

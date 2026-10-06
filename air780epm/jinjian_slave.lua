@@ -32,6 +32,10 @@
 对外接口：
   jinjian_slave.handle_frame(frame)  离线测试用：喂入请求帧返回响应帧（或 nil）
   jinjian_slave.get_stats()          从机统计
+                                     queries   = 收到中控的 BMS 查询/请求次数（从站地址=本机）
+                                     responses = 对中控查询的应答次数
+                                     rx_frames = 收到的 CRC 正确帧数（含非本机地址）
+                                     ignored   = 从站地址不匹配而忽略的帧数
   jinjian_slave.get_cache()          本地缓存（充电设置等）
 ]]
 
@@ -50,6 +54,13 @@ local JJ_MAX_CELLS = 24
 local function d_info(...) if cfg.LOG_ENABLE then log.info("jj", ...) end end
 local function d_warn(...) if cfg.LOG_ENABLE then log.warn("jj", ...) end end
 local function d_debug(...) if cfg.LOG_RAW_FRAMES then log.info("jj.raw", ...) end end
+
+local function now_ms()
+    if mcu and mcu.ticks and mcu.hz then
+        return math.floor(mcu.ticks() * 1000 / mcu.hz())
+    end
+    return os.time() * 1000
+end
 
 --=============================================================================
 -- Modbus CRC16（0xA001 多项式，低字节在前）
@@ -99,11 +110,14 @@ local cache = {
 }
 
 local stats = {
-    rx_frames = 0,   -- 收到且 CRC 正确的请求帧数
+    rx_frames = 0,   -- 收到且 CRC 正确的请求帧数（含其它从站地址的帧）
     tx_frames = 0,   -- 发出的响应帧数
+    queries = 0,     -- 收到中控的 BMS 查询/请求次数（从站地址匹配本机）
+    responses = 0,   -- 对中控查询的应答次数（成功组帧并发出响应即 +1）
     ignored = 0,     -- 从站地址不匹配而忽略的帧数
     errors = {},     -- 各功能码异常次数
     last_error = nil,
+    last_query_ms = nil, -- 最近一次收到中控查询的时刻(tick ms)，nil = 尚未收到
 }
 
 --=============================================================================
@@ -381,6 +395,9 @@ local function handle_request(frame)
         stats.ignored = stats.ignored + 1
         return nil
     end
+    -- 中控对本机的一次 BMS 查询/请求（读取或写入）
+    stats.queries = stats.queries + 1
+    stats.last_query_ms = now_ms()
 
     local func = string.byte(frame, 2)
     d_debug("RX", to_hex(frame))
@@ -410,6 +427,7 @@ local function handle_request(frame)
 
     if resp then
         stats.tx_frames = stats.tx_frames + 1
+        stats.responses = stats.responses + 1
     end
     return resp
 end

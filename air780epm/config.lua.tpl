@@ -83,6 +83,11 @@ M.MQTT_CONNACK_TIMEOUT_MS      = 60000  -- 单次等待 CONNACK 上限
 -- 14 × 2.17s ≈ 30s，即"每 30 秒聚合上报一包"。
 M.BATCH_SAMPLES                = 14 -- 一批样本数（= 一轮广播一条样本）
 
+-- 上报周期：与采集解耦，无论是否采集到极空数据，每 REPORT_PERIOD_MS 都上报一包；
+-- 采集不到数据（极空无广播/未接入）时用兜底样本填充，保证按时上报不中断。
+M.REPORT_PERIOD_MS             = 30000 -- 上报周期（毫秒），默认 30s（≈14 条广播）
+M.REPORT_HOLD_LAST             = true  -- 兜底样本取值：true=沿用最近一次极空快照，false=全 0
+
 -- 电池串数：0 = 按广播自动识别（推荐）；>0 = 固定串数（覆盖自动识别）
 M.CELL_COUNT                   = 0
 
@@ -108,5 +113,6 @@ M.SUPPLY_REPORT_MS             = 60000         -- 供电电压打印周期
 M.LOG_ENABLE                   = true  -- 模块业务日志总开关
 M.LOG_HEX_PAYLOAD              = false -- 是否打印 MQTT 报文整体 hex（调试用）
 M.LOG_RAW_FRAMES               = false -- 是否打印极空/金箭链路原始帧（调试用）
+M.STATUS_REPORT_MS             = 60000 -- 周期状态日志间隔（极空数据/中控查询/上报计数汇总）
 
 return M

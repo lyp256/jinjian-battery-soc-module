@@ -40,9 +40,39 @@ board.init()
 require "ntp_sync"
 
 -- 业务模块
-require "jk_display"      -- 极空广播接收（RS4851）
+local cfg = require "config"
+local jk = require "jk_display"       -- 极空广播接收（RS4851）
 local uplink = require "bms_uplink" -- 采样聚合 + MQTT 压缩上报（MQTT_HOST 为空时自动关闭）
-require "jinjian_slave"   -- 金箭 Modbus 从机（RS4852）
+local jj = require "jinjian_slave"    -- 金箭 Modbus 从机（RS4852）
+
+--=============================================================================
+-- 周期状态日志：每 STATUS_REPORT_MS 汇总两条链路的收发计数，便于现场判断
+--   1) 极空保护板数据次数：jk.rounds（完整广播轮数）/ jk.frames（解析帧数）；
+--   2) 中控 BMS 查询/应答：jj.queries（收到本机的查询次数）/ jj.responses（应答次数），
+--      jj.ignored（非本机地址帧数）；
+--   3) 4G 上报：采样/批次/发布/丢弃数与 MQTT 状态。
+--=============================================================================
+sys.taskInit(function()
+    local period = cfg.STATUS_REPORT_MS or 60000
+    while true do
+        sys.wait(period)
+        local jks = jk.get_stats()
+        local jjs = jj.get_stats()
+        local ups = uplink.get_stats()
+        local mqtt_state = (not uplink.is_enabled()) and "disabled"
+            or (uplink.is_mqtt_ready() and "up" or "down")
+        if cfg.LOG_ENABLE then
+            log.info("stat",
+                "jk_rounds", jks.rounds, "jk_frames", jks.frames,
+                "ctrl_query", jjs.queries, "ctrl_reply", jjs.responses,
+                "ctrl_ignored", jjs.ignored,
+                "samples", ups.samples, "fallback", ups.placeholders,
+                "batches", ups.batches,
+                "published", ups.published, "dropped", ups.dropped,
+                "mqtt", mqtt_state)
+        end
+    end
+end)
 
 -- 网络任务：等待 4G 拨号成功（IP_READY），发布 "net_ready"（携带设备 ID）
 -- 兼容不同固件的 socket API：adapter/dft 不存在时视为未就绪

@@ -25,6 +25,8 @@
   jk_display.get_state()   最近一轮解析结果（table），从未收到时返回 nil
   jk_display.is_fresh()    最近一轮是否在超时时间内
   jk_display.get_stats()   统计信息（轮数、帧数、错误数、最近错误）
+                           rounds = 收到极空保护板的数据次数（完整广播轮数，一轮一份数据）
+                           frames = 已解析帧数
   jk_display.MAX_CELLS     协议里单体的最大槽位数（主块 24 + 0x2011 补发的第 25 节）
 
 每解析完一轮广播（扩展块结束）发布一次 "JK_ROUND" 事件，携带本轮 state，
@@ -47,7 +49,7 @@ local function d_debug(...) if cfg.LOG_RAW_FRAMES then log.info("jk.raw", ...) e
 --=============================================================================
 local stats = {
     frames = 0,          -- 已解析帧数
-    rounds = 0,          -- 已完成轮数
+    rounds = 0,          -- 已完成轮数（= 收到极空保护板的数据次数，一轮一份数据）
     sync_lost = 0,       -- 因帧头/长度非法丢弃的字节数（重新同步）
     bad_len = 0,         -- 长度与命令码不匹配的帧数
     cell_mismatch = 0,   -- Σ单体电压 与 总电压 明显不符的次数

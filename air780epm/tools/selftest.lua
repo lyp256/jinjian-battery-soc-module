@@ -277,6 +277,7 @@ check("颜色帧有效槽位数", s.colorCells, 20)
 check("记录块数", s.records, 27)
 check("估算总容量 mAh", s.fullCapMah, math.floor(27500 * 100 / 51 + 0.5))
 check("统计轮数", jk.get_stats().rounds, 1)
+check("收到极空数据次数(=轮数)", jk.get_stats().rounds, 1)
 check("扩展块/主块交叉校验无失配", jk.get_stats().crosscheck_mismatch, 0)
 check("轮起点(写寄存器)计数", jk.get_stats().reg_writes, 1)
 
@@ -449,6 +450,16 @@ do
     check("其它从站不应答", resp2, nil)
 end
 
+-- 3.12 计数统计：中控 BMS 查询次数 / 应答次数
+do
+    local st = jj.get_stats()
+    check("查询计数已累加", st.queries > 0, true)
+    check("查询次数 = 应答次数", st.queries, st.responses)
+    check("忽略非本机地址帧计数", st.ignored, 1)
+    check("收帧数 = 查询 + 忽略", st.rx_frames, st.queries + st.ignored)
+    check("最近查询时间已记录", st.last_query_ms ~= nil, true)
+end
+
 --=============================================================================
 -- 4. 端到端：采样 → 批次 → 压缩编码 → MQTT 发布（用独立解码器核对）
 --=============================================================================
@@ -509,6 +520,11 @@ scheduler.wake()
 check("MQTT 已连接", uplink.is_mqtt_ready(), true)
 check("上报主题", uplink.topic(), "/bms/TESTDEV123/status")
 
+-- 4.2.1 上报与采集解耦：尚无任何采集数据时，也会按周期上报兜底批次
+check("无采集数据也上报", #published, 1)
+check("兜底批次占满一批样本", uplink.get_stats().placeholders, 14)
+check("此时真实样本仍为 0", uplink.get_stats().samples, 0)
+
 -- 4.3 喂 14 轮广播（SOC 每轮 +1，其余字段与手册样本一致）
 local function set_round_soc(hex_round, soc)
     -- 主数据块 SOC 位于数据块偏移 6，数据块起点为帧内第 12 字节 → 第 19 字节
@@ -520,13 +536,14 @@ for i = 1, 14 do
     jk.feed(r)
     pump()
 end
-scheduler.wake()
+-- 注意：不再调用 scheduler.wake()，否则会额外触发一次兜底上报，破坏下面的计数断言
 
-check("已发布 1 包", #published, 1)
-local msg = published[1]
+check("已发布 2 包(兜底+真实)", #published, 2)
+local msg = published[2]
 check("发布主题", msg and msg.topic, "/bms/TESTDEV123/status")
 check("发布 QoS", msg and msg.qos, 0)
-check("样本批次计数", uplink.get_stats().batches, 1)
+check("批次计数(兜底+真实)", uplink.get_stats().batches, 2)
+check("真实样本计数", uplink.get_stats().samples, 14)
 
 -- 4.4 独立实现解码器（对照格式规范），解回数据逐条核对
 local function get_uvarint(data, pos)
@@ -697,6 +714,16 @@ if ok_dec then
         #msg.payload, dec.spatial and "spatial" or "offset"))
 else
     io.write("[error] ", tostring(dec), "\n")
+end
+
+-- 4.5 兜底批次（无采集数据）同样可被解码：样本数不变，串数沿用最近一次极空快照
+do
+    local ok_fb, fb = pcall(decode_payload, published[1].payload)
+    check("兜底批次可被解码", ok_fb, true)
+    if ok_fb then
+        check("兜底批次样本数", fb.count, 14)
+        check("兜底批次串数(沿用最近)", fb.cellCount, 20)
+    end
 end
 
 --=============================================================================
