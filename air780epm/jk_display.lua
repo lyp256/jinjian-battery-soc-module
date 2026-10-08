@@ -342,6 +342,8 @@ local function finalize_round()
         #alarms > 0 and ("alarm=" .. table.concat(alarms, ",")) or "alarm=none")
 
     work = new_work()
+    -- 一轮一条样本：注意 sys.publish 只保留最后一次事件值，
+    -- 消费端（bms_uplink 采样任务）必须能及时消费，否则会丢轮（见其 stats.rounds_lost）。
     sys.publish("JK_ROUND", s)
 end
 
@@ -443,6 +445,8 @@ end
 --=============================================================================
 local opened = false
 
+-- 串口接收回调：只把字节搬进缓冲并打一个"有新数据"标记，解析交给独立的解析任务。
+-- 这样回调本身很快返回，不会长时间占住调度器（一轮广播 364 字节、周期 0.5-2.2s）。
 local function on_receive(id)
     local s = ""
     repeat
@@ -456,7 +460,7 @@ local function on_receive(id)
         stats.sync_lost = stats.sync_lost + (#buf - cfg.JK_RX_BUFF_SIZE)
         buf = buf:sub(-cfg.JK_RX_BUFF_SIZE)
     end
-    parse_buffer()
+    sys.publish("JK_RX")
 end
 
 local function open_uart()
@@ -483,15 +487,17 @@ sys.taskInit(function()
         d_warn("uart", cfg.JK_UART_ID, "open failed, retry")
         sys.wait(1000)
     end
-    -- 数据失效看门狗：广播中断超过 JK_DATA_TIMEOUT_MS 标记 stale
+    -- 解析任务 + 数据失效看门狗：
+    --   · 收到 JK_RX（串口回调只做搬字节）后解析，避免在回调里做重活；
+    --   · 没有数据时每 2s 醒一次，检查广播是否中断超过 JK_DATA_TIMEOUT_MS → 标记 stale。
     while true do
-        sys.wait(2000)
+        if sys.waitUntil("JK_RX", 2000) then
+            parse_buffer()
+        end
         if state and stats.last_round_ms then
-            if now_ms() - stats.last_round_ms > cfg.JK_DATA_TIMEOUT_MS then
-                if not state.stale then
-                    state.stale = true
-                    d_warn("broadcast timeout, last round", state.ts)
-                end
+            if now_ms() - stats.last_round_ms > cfg.JK_DATA_TIMEOUT_MS and not state.stale then
+                state.stale = true
+                d_warn("broadcast timeout, last round", state.ts)
             end
         end
     end

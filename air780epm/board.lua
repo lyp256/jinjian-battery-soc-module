@@ -149,12 +149,19 @@ function M.read_supply_voltage()
     if not adc.open(cfg.ADC_SUPPLY_CHANNEL) then
         return nil
     end
+    -- 单次 adc.get 是同步转换（部分固件里是忙等，可能占用数 ms），因此按
+    -- cfg.ADC_SUPPLY_SAMPLES 逐次采样、每次之间让出一次，避免一次读满多次
+    -- 把调度器占住（影响串口/网络任务）。
+    local samples = cfg.ADC_SUPPLY_SAMPLES or 3
     local sum, n = 0, 0
-    for _ = 1, 5 do
+    for i = 1, samples do
         local v = adc.get(cfg.ADC_SUPPLY_CHANNEL)
         if v then
             sum = sum + v
             n = n + 1
+        end
+        if i < samples then
+            sys.wait(1)
         end
     end
     adc.close(cfg.ADC_SUPPLY_CHANNEL)

@@ -19,7 +19,7 @@
     8     板温       极空 MOS 温度（整数 ℃）
     9-32  单体电压   极空单体电压 mV
     103   电池类型   固定 0（锂电）
-    104   循环次数   本地缓存（极空广播无此数据）
+    104   循环次数   Modbus 数据源取极空 SOCCycleCount；显示屏广播无此数据，用本地缓存
     110   均衡状态   极空均衡开关状态
     113   标称容量   估算总容量 Ah
     1000-1007 PN     模块自身 PN（SOC-XXXXXXXXXXXX，16 ASCII）
@@ -40,7 +40,7 @@
 ]]
 
 local cfg = require "config"
-local jk = require "jk_display"
+local jk = require "jk"          -- 极空数据源（显示屏广播 / RS485 Modbus，按 config 选择）
 local board = require "board"
 
 local M = {}
@@ -97,6 +97,21 @@ end
 -- 十六进制字符串（LuatOS 的 string:toHex() 在 PC Lua 上不存在，这里自备）
 local function to_hex(s)
     return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end))
+end
+
+-- 原始帧十六进制限频打印：LOG_RAW_FRAMES 打开时每 LOG_HEX_EVERY_N 帧打一次，
+-- 避免高频日志（含大字符串）本身挤占调度器。
+local hex_dumps = 0
+local function d_hex(tag, s)
+    if not cfg.LOG_RAW_FRAMES then
+        return
+    end
+    hex_dumps = hex_dumps + 1
+    local every = cfg.LOG_HEX_EVERY_N or 20
+    if every > 1 and (hex_dumps - 1) % every ~= 0 then
+        return
+    end
+    log.info("jj.raw", tag, to_hex(s))
 end
 
 --=============================================================================
@@ -257,6 +272,10 @@ local function reg_value(addr)
     elseif addr == 103 then                               -- 电池类型
         return cfg.JJ_BATTERY_TYPE
     elseif addr == 104 then                               -- 循环次数
+        -- Modbus 数据源能读到极空 SOCCycleCount，显示屏广播没有则用本地缓存
+        if s and s.cycleCount then
+            return s.cycleCount
+        end
         return cache.cycleCount
     elseif addr == 110 then                               -- 均衡状态
         return (s and s.balanceSw == 1) and 1 or 0
@@ -400,7 +419,7 @@ local function handle_request(frame)
     stats.last_query_ms = now_ms()
 
     local func = string.byte(frame, 2)
-    d_debug("RX", to_hex(frame))
+    d_hex("RX", frame)
 
     local resp
     if func == FUNC_READ_REGS then
@@ -471,6 +490,9 @@ end
 --=============================================================================
 local rx = ""
 
+-- 串口接收回调：只把字节搬进缓冲并打一个"有新数据"标记，
+-- 帧扫描与应答交给独立的 parse_task。这样回调本身很快返回，
+-- 既不会长时间占住调度器，也不会拖慢串口驱动的收发。
 local function on_receive(id)
     local s = ""
     repeat
@@ -484,7 +506,14 @@ local function on_receive(id)
         d_warn("rx overflow, drop", #rx)
         rx = rx:sub(-cfg.JJ_MAX_FRAME_LEN)
     end
+    sys.publish("JJ_RX")
+end
 
+-- 解析缓冲里的完整请求帧并应答。每处理 JJ_PARSE_MAX_FRAMES 帧主动让出一次，
+-- 避免突发帧流把调度器一次占满（剩余字节留在 rx 里，下次唤醒继续处理）。
+local function process_rx()
+    local budget = cfg.JJ_PARSE_MAX_FRAMES or 8
+    local n = 0
     while #rx >= 4 do
         local frame, off, need = scan_frame(rx)
         if not frame then
@@ -501,7 +530,12 @@ local function on_receive(id)
         local resp = handle_request(frame)
         if resp then
             uart.write(cfg.JJ_UART_ID, resp)
-            d_debug("TX", to_hex(resp))
+            d_hex("TX", resp)
+        end
+        n = n + 1
+        if n >= budget then
+            n = 0
+            sys.wait(1)
         end
     end
 end
@@ -525,9 +559,16 @@ sys.taskInit(function()
                     string.format("version %04X %04X", version_regs[1], version_regs[2]))
             else
                 d_warn("uart", cfg.JJ_UART_ID, "open failed, retry")
+                sys.wait(1000)
             end
+        elseif opened then
+            -- 收到字节事件后解析/应答；2s 超时只是兜底（无数据时也定期回到调度器）
+            if sys.waitUntil("JJ_RX", 2000) then
+                process_rx()
+            end
+        else
+            sys.wait(1000)
         end
-        sys.wait(1000)
     end
 end)
 

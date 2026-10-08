@@ -35,7 +35,7 @@
 ]]
 
 local cfg = require "config"
-local jk = require "jk_display"
+local jk = require "jk"          -- 极空数据源（显示屏广播 / RS485 Modbus，按 config 选择）
 local codec = require "bms_codec"
 local board = require "board"
 
@@ -91,6 +91,7 @@ local batch_cell_count = 0 -- 当前批次固定的串数
 local stats = {
     samples = 0,        -- 真实采集样本数（一轮极空广播 = 一条）
     placeholders = 0,   -- 无采集数据时用兜底值填充的样本数
+    rounds_lost = 0,    -- 采集任务来不及消费而丢掉的极空轮数（sys.publish 只保留最后一次）
     batches = 0,
     published = 0,
     dropped = 0,
@@ -118,7 +119,15 @@ local function connect_mqtt()
     if not MQTT_ENABLE then
         return
     end
-    local _, id = sys.waitUntil("net_ready")
+    -- 等待 4G 拨号完成：限时等待 + 周期提示（sys.waitUntil 挂起协程，不占 CPU；
+    -- 加超时只是让现场日志能看出"卡在等网络"，不是阻塞其它任务）
+    local ok, id
+    repeat
+        ok, id = sys.waitUntil("net_ready", 60000)
+        if not ok then
+            d_warn("waiting for net_ready ...")
+        end
+    until ok
     device_id = id or "unknown"
     pub_topic = cfg.MQTT_TOPIC_PREFIX .. "/" .. device_id .. "/status"
     d_info("topic", pub_topic)
@@ -156,11 +165,9 @@ local function connect_mqtt()
     end)
 
     mqttc:connect()
-    -- 最多等 60s CONNACK；未连上时批次按"未就绪丢弃"处理，autoreconn 会继续重连
+    -- 最多等 60s CONNACK（只用于日志/串灯提示）。未连上时批次按"未就绪丢弃"处理；
+    -- 重连由 mqtt 的 autoreconn 与事件回调负责，本任务到这里即可结束，不留空转协程。
     sys.waitUntil("mqtt_conack", cfg.MQTT_CONNACK_TIMEOUT_MS)
-    while true do
-        sys.wait(60000)
-    end
 end
 
 --=============================================================================
@@ -225,9 +232,10 @@ local function add_sample(s, is_fallback)
     local pos = ring.count + 1
     ring.time[pos] = s.ts
     ring.temp1[pos] = s.tempBatC * 10      -- 0.1℃
-    ring.temp2[pos] = s.tempBatC * 10      -- 极空广播只有一路电池温度
+    -- 显示屏广播只有一路电池温度（temp1 = temp2）；Modbus 数据源有温度传感器 2
+    ring.temp2[pos] = (s.tempBat2C or s.tempBatC) * 10
     ring.tempMos[pos] = s.tempMosC * 10
-    ring.balanCurrent[pos] = 0             -- 广播里没有均衡电流
+    ring.balanCurrent[pos] = s.balanCurrentMa or 0 -- 广播里没有均衡电流，Modbus 有
     ring.batVol[pos] = s.batVolMv
     ring.batCurrent[pos] = s.batCurrentMa  -- 充电为正
     ring.socCycleCap[pos] = s.fullCapMah   -- 估算总容量 mAh
@@ -261,7 +269,9 @@ local function fallback_sample(ts)
             batCurrentMa = s.batCurrentMa,
             soc = s.soc,
             tempBatC = s.tempBatC,
+            tempBat2C = s.tempBat2C,
             tempMosC = s.tempMosC,
+            balanCurrentMa = s.balanCurrentMa,
             fullCapMah = s.fullCapMah or 0,
             capRemainMah = s.capRemainMah or 0,
         }
@@ -280,12 +290,22 @@ local function fallback_sample(ts)
     }
 end
 
--- 采样任务：首样本前等待 NTP 对时（最多 60s），保证 Time 列准确
+-- 采样任务：首样本前等待 NTP 对时（最多 60s），保证 Time 列准确。
+-- 说明（LuatOS 单线程协作式调度）：
+--   · sys.waitUntil 只是挂起本协程，事件不来时本任务休眠、不占 CPU，不影响其它任务；
+--   · sys.publish 只保留"最后一次"事件值：若本任务未及时消费，中间的轮次会被覆盖丢失。
+--     本任务每条样本只做几次表复制（微秒级），正常不会丢；这里统计丢轮数便于现场判断。
 local function task_sample()
     sys.waitUntil("ntp_synced", 60000)
+    local consumed = jk.get_stats().rounds or 0 -- 以开始消费时的轮数为基准，避免统计开机前的轮次
     while true do
         local ok, s = sys.waitUntil("JK_ROUND")
         if ok and s then
+            local total = jk.get_stats().rounds or 0
+            if total - consumed > 1 then
+                stats.rounds_lost = stats.rounds_lost + (total - consumed - 1)
+            end
+            consumed = total
             add_sample(s)
         end
     end
@@ -314,11 +334,23 @@ end
 --=============================================================================
 -- 上报：编码 + MQTT 发布
 --=============================================================================
+-- 编码分片让出：codec 是纯 CPU 计算（无 IO），长批次/多电芯时同步跑会长时间占住
+-- 调度器（实测 14×20≈0.55ms、30×32≈1.3ms 于 PC Lua，模组上还要慢数倍），
+-- 这里每编码若干列主动让出一次（cfg.ENCODE_YIELD_MS = 0/nil 时不让出）。
+local function encode_yield()
+    local ms = cfg.ENCODE_YIELD_MS
+    if ms and ms > 0 then
+        -- 让出只在协程（任务）里可行：flush() 等调试入口若在非任务上下文被调用，
+        -- sys.wait 会报错，这里吞掉异常，退化成同步编码（不影响结果）
+        pcall(sys.wait, ms)
+    end
+end
+
 local function task_publish()
     while true do
         local ok, idx = sys.waitUntil("BMS_BATCH_READY")
         if ok and idx and hists[idx] then
-            local payload = codec.encode(hists[idx])
+            local payload = codec.encode(hists[idx], encode_yield)
             if payload then
                 stats.last_payload_len = #payload
                 d_info("batch encoded", #payload, "bytes")
@@ -401,7 +433,7 @@ function M.flush()
             h.cellVols[base + j] = ring.cellVols[base + j]
         end
     end
-    local payload = codec.encode(h)
+    local payload = codec.encode(h, encode_yield)
     if not payload then
         return false, "encode failed"
     end

@@ -12,7 +12,9 @@
 模块划分：
   config.lua          集中配置（串口/GPIO/波特率/MQTT/批次等）
   board.lua           D700Tm 板级资源（LED/按键/看门狗/可控电源/供电电压）
-  jk_display.lua      极空显示屏协议接收解析，每轮广播发布 "JK_ROUND"
+  jk.lua              极空数据源入口：按 config.JK_PROTOCOL 转发到下面两个实现之一
+  jk_display.lua      极空显示屏协议接收解析（2400 广播，只收），每轮发布 "JK_ROUND"
+  jk_modbus.lua       极空 RS485 Modbus 主站轮询（115200），每轮发布 "JK_ROUND"
   jinjian_slave.lua   金箭 Modbus RTU 从机
   bms_uplink.lua      采样批次 + BMSStateHistory 压缩编码 + MQTT 上报
   bms_codec.lua       压缩编码器（列式 Delta+ZigZag+Varint，与上报服务端字节兼容）
@@ -41,7 +43,7 @@ require "ntp_sync"
 
 -- 业务模块
 local cfg = require "config"
-local jk = require "jk_display"       -- 极空广播接收（RS4851）
+local jk = require "jk"               -- 极空数据源（RS4851，显示屏广播或 Modbus 轮询）
 local uplink = require "bms_uplink" -- 采样聚合 + MQTT 压缩上报（MQTT_HOST 为空时自动关闭）
 local jj = require "jinjian_slave"    -- 金箭 Modbus 从机（RS4852）
 
@@ -67,6 +69,7 @@ sys.taskInit(function()
                 "ctrl_query", jjs.queries, "ctrl_reply", jjs.responses,
                 "ctrl_ignored", jjs.ignored,
                 "samples", ups.samples, "fallback", ups.placeholders,
+                "lost", ups.rounds_lost,
                 "batches", ups.batches,
                 "published", ups.published, "dropped", ups.dropped,
                 "mqtt", mqtt_state)

@@ -7,6 +7,10 @@
 --   local payload = bms_codec.encode(hist)
 --   payload 为 string, 可直接作为 MQTT 二进制 payload 上报。
 --
+-- 可选第二参 on_slice: 编码是纯 CPU 计算（无 IO），每编码 SLICE_COLUMNS 列调用一次
+--   该回调，供 LuatOS 侧的调用者主动让出（如 sys.wait(1)），避免长 CPU 段挤占串口收发。
+--   不传（PC 端测试/离线工具）则完全同步执行，输出字节不变。
+--
 -- hist 为扁平结构, 避免嵌套 table 造成的 GC 压力:
 --   hist.count      = 样本数 N
 --   hist.cellCount  = 电芯数 C (固定)
@@ -271,7 +275,10 @@ local function build_columns(hist, cellSpatial)
     return cols
 end
 
-local function encode_columns(cols, count, cellCount, cellSpatial)
+-- 每处理这么多列回调一次 on_slice，供上层插入 sys.wait 让出调度（见文件头说明）
+local SLICE_COLUMNS = 16
+
+local function encode_columns(cols, count, cellCount, cellSpatial, on_slice)
     local encoded, defaults, modes = {}, {}, {}
     local saved = 0
     for i = 1, #cols do
@@ -284,6 +291,9 @@ local function encode_columns(cols, count, cellCount, cellSpatial)
             saved = saved + #defaults[i] - #best
         else
             encoded[i] = defaults[i]
+        end
+        if on_slice and (i % SLICE_COLUMNS) == 0 then
+            on_slice()
         end
     end
 
@@ -319,16 +329,17 @@ local function encode_columns(cols, count, cellCount, cellSpatial)
 end
 
 -- hist.cellCount 可为 nil/0, 表示无电芯列
-function M.encode(hist)
+-- on_slice: 可选，每编码 SLICE_COLUMNS 列回调一次（供上层让出），不传则纯同步
+function M.encode(hist, on_slice)
     local n = hist.count
     local c = hist.cellCount or 0
     if n == nil or n < 1 then
         return nil
     end
 
-    local best = encode_columns(build_columns(hist, false), n, c, false)
+    local best = encode_columns(build_columns(hist, false), n, c, false, on_slice)
     if c > 0 then
-        local cand = encode_columns(build_columns(hist, true), n, c, true)
+        local cand = encode_columns(build_columns(hist, true), n, c, true, on_slice)
         if #cand < #best then
             best = cand
         end

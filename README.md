@@ -8,7 +8,7 @@
 
 | 实现 | 硬件 / 框架 | 说明 |
 |---|---|---|
-| [`air780epm/`](air780epm/README.md) | 银尔达 D700Tm（Air780EPM）LuatOS | 极空显示屏广播采集 |
+| [`air780epm/`](air780epm/README.md) | 银尔达 D700Tm（Air780EPM）LuatOS | 极空采集（显示屏广播 / RS485 Modbus 可在配置里切换）|
 | [`esp32/`](esp32/README.md) | ESP32-S3 + 两路 THVD1406DR RS485 + ML307-NL 4G | 半成品仅供参考，优先参考 `air780epm` 实现。esp32 系列有蓝牙模块支持多路串口，可以实现本地蓝牙、wifi 配置等高级功能但是奈何目前市面上没有成熟一体化模块，需要画PCB 定制。|
 
 
@@ -19,6 +19,6 @@
 | [`docs/jinjian/02_BMS_PROTOCOL.md`](docs/jinjian/02_BMS_PROTOCOL.md) | 金箭 BMS 通讯协议（本模块作为 Modbus 从机应答） |
 | [`docs/jinjian/01_BLE_PROTOCOL.md`](docs/jinjian/01_BLE_PROTOCOL.md) | 金箭智行 BLE 控制协议 |
 | [`docs/jinjian/03_BMS_COLLECTION_REPORT.md`](docs/jinjian/03_BMS_COLLECTION_REPORT.md) | BMS 上报消息清单与实现要点 |
-| [`docs/jinjian/JK-BMS-RS485.md`](docs/jinjian/JK-BMS-RS485.md) | 极空 JK-BMS RS485 Modbus 通用协议（V1.1） |
+| [`docs/jikong/JK-BMS-RS485.md`](docs/jikong/JK-BMS-RS485.md) | 极空 JK-BMS RS485 Modbus 通用协议（V1.1） |
 | [`docs/jikong/极空显示屏协议.md`](docs/jikong/极空显示屏协议.md) | 极空显示屏广播协议 |
 车。

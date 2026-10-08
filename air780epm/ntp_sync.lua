@@ -20,7 +20,11 @@ local HOURLY_INTERVAL_MS = 3600 * 1000 -- 成功后 1 小时对时一次
 local RETRY_INTERVAL_MS = 10 * 1000    -- 失败后 10 秒重试
 
 sys.taskInit(function()
-    sys.waitUntil("net_ready")
+    -- 等待联网：限时等待 + 周期提示，便于现场判断卡在哪一步
+    -- （sys.waitUntil 挂起协程，等待期间不占 CPU，不影响其它任务）
+    while not sys.waitUntil("net_ready", 60000) do
+        log.warn("ntp_sync", "waiting for net_ready ...")
+    end
 
     sys.subscribe("NTP_ERROR", function(err_info)
         log.error("ntp_sync", "ntp error", err_info or "unknown")

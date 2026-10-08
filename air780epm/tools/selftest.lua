@@ -1,8 +1,8 @@
 --[[
 @module  selftest
 @summary 离线自测（PC 端 Lua 5.4）
-@version 1.1
-@date    2026.09.28
+@version 1.2
+@date    2026.10.08
 @usage
 在 air780epm 目录下执行：
     lua tools/selftest.lua
@@ -12,7 +12,10 @@
 2. jk_display 解析整轮广播样本（docs/jikong/极空显示屏协议.md §7）并核对全部物理量；
 3. jinjian_slave 对 01 03 / 01 01 / 01 06 / 01 05 的应答、异常码与文档 CRC 样例；
 4. 端到端：用协程调度器真跑 bms_uplink 的"采样→批次→编码→发布"链路，
-   并用独立实现的解码器解回数据做逐条核对。
+   并用独立实现的解码器解回数据做逐条核对；
+5. jk_modbus（极空 RS485 Modbus 主站）：用 uart.write 打桩模拟一台从机，
+   核对请求组帧/CRC、寄存器解析与单位换算、报警位映射、异常响应降级，
+   以及同一份快照驱动金箭从机寄存器与开关量。
 ]]
 
 --=============================================================================
@@ -30,6 +33,9 @@ _G.log = {
 
 -- 极简协作式调度器：sys.taskInit / sys.wait / sys.waitUntil / sys.publish
 local tasks, events = {}, {}
+-- 事件投递目标：LuatOS 的 publish 会唤醒"当时所有"等待该事件的协程
+-- （而不是被第一个消费者独占），这里用 per-task 记录来模拟该语义
+local pending = {}
 local scheduler = {}
 
 _G.sys = {}
@@ -53,7 +59,13 @@ function _G.sys.waitUntil(name, _timeout)
 end
 
 function _G.sys.publish(name, data)
-    events[name] = (data == nil) and true or data
+    local v = (data == nil) and true or data
+    events[name] = v
+    for _, t in ipairs(tasks) do
+        if t.event == name then
+            pending[t] = v
+        end
+    end
 end
 
 _G.sys.subscribe = function() end
@@ -66,10 +78,16 @@ local function pump(max_steps)
     while steps < max_steps do
         local ran = false
         for _, t in ipairs(tasks) do
-            if not t.dead and not t.sleeping and (not t.event or events[t.event] ~= nil) then
+            if not t.dead and not t.sleeping
+               and (pending[t] ~= nil or not t.event or events[t.event] ~= nil) then
                 local arg
                 if t.event then
-                    arg = events[t.event]
+                    if pending[t] ~= nil then
+                        arg = pending[t]
+                        pending[t] = nil
+                    else
+                        arg = events[t.event]
+                    end
                     events[t.event] = nil
                 end
                 local ok, y = coroutine.resume(t.co, arg)
@@ -108,6 +126,11 @@ end
 -- 测试里把前面章节遗留的 JK_ROUND 清掉，保证第 4 节从干净状态开始计数）
 function scheduler.clear(name)
     events[name] = nil
+    for _, t in ipairs(tasks) do
+        if t.event == name then
+            pending[t] = nil
+        end
+    end
 end
 
 _G.uart = {
@@ -197,6 +220,37 @@ do
     }
     local want = "0209aaaa2af403f003d8040aa0960300a08d0690bf0580e2cfaa06e41902"
     check("vector2 (3x2 静态) 字节一致", to_hex(codec.encode(hist)), want)
+end
+
+-- 1.3 编码分片让出钩子：每 SLICE_COLUMNS 列回调一次，且输出与同步编码字节一致
+do
+    local hist = {
+        count = 30, cellCount = 32,
+        temp1 = {}, temp2 = {}, tempMos = {}, balanCurrent = {},
+        batVol = {}, batCurrent = {}, socCycleCap = {}, socCapRemain = {},
+        time = {}, cellVols = {},
+    }
+    for i = 1, 30 do
+        hist.temp1[i] = 320 + (i % 3)
+        hist.temp2[i] = 325 + (i % 3)
+        hist.tempMos[i] = 330
+        hist.balanCurrent[i] = 10 + i
+        hist.batVol[i] = 66070 + i
+        hist.batCurrent[i] = 3400 - i
+        hist.socCycleCap[i] = 54000
+        hist.socCapRemain[i] = 25000 + i
+        hist.time[i] = 1700000000 + i
+    end
+    for s = 0, 29 do
+        for j = 1, 32 do
+            hist.cellVols[s * 32 + j] = 3300 + ((s + j) % 4)
+        end
+    end
+
+    local slices = 0
+    local with_hook = codec.encode(hist, function() slices = slices + 1 end)
+    check("编码分片钩子被调用", slices > 0, true)
+    check("分片编码输出与同步编码一致", with_hook, codec.encode(hist))
 end
 
 --=============================================================================
@@ -469,6 +523,9 @@ io.write("== 端到端上报链路（14×20） ==\n")
 do
     local cfg = require "config"
     cfg.MQTT_HOST = ""
+    -- 离线调度器不模拟毫秒睡眠（sys.wait 会让任务一直"睡"到显式唤醒），
+    -- 因此自测里关掉编码分片让出；让出钩子本身由 1.3 单独覆盖。
+    cfg.ENCODE_YIELD_MS = 0
     local off = dofile(here .. "/../bms_uplink.lua")
     pump()
     for _ = 1, 3 do
@@ -725,6 +782,264 @@ do
         check("兜底批次串数(沿用最近)", fb.cellCount, 20)
     end
 end
+
+--=============================================================================
+-- 5. 极空 RS485 Modbus 主站（config.JK_PROTOCOL = "modbus" 的另一条数据源）
+--    用 uart.write 打桩模拟一台极空从机，验证组帧 / CRC / 解析 / 单位换算 / 报警位，
+--    并确认同一份快照能驱动金箭从机寄存器（两条数据源共用下游）。
+--=============================================================================
+io.write("== 极空 RS485 Modbus 主站解析 ==\n")
+
+local cfg_mb = require "config"
+local JK_UART = cfg_mb.JK_UART_ID
+
+-- 5.1 模拟从机寄存器表（地址 → 16bit 值），数值取手册样例量级
+local sim = {}
+for i = 0, 31 do sim[0x1200 + i] = 3304 end
+sim[0x1206] = 3302                                    -- 第 7 节
+sim[0x1207] = 3302                                    -- 第 8 节
+sim[0x1240], sim[0x1241] = 0x000F, 0xFFFF             -- CellSta 低 20 位 = 1 → 20 节
+sim[0x128A] = 330                                     -- TempMos 33.0℃
+sim[0x1290], sim[0x1291] = 1, 534                     -- BatVol 66070mV
+sim[0x1298], sim[0x1299] = 0, 3400                    -- BatCurrent +3400mA
+sim[0x129C] = 320                                     -- TempBat1 32.0℃
+sim[0x129E] = 325                                     -- TempBat2 32.5℃
+sim[0x12A0], sim[0x12A1] = 0, 0                       -- Alarm = 0
+sim[0x12A4] = 12                                      -- BalanCurrent 12mA
+sim[0x12A6] = (2 << 8) | 51                           -- BalanSta=2(放电), SOC=51
+sim[0x12A8], sim[0x12A9] = 0, 27500                   -- SOCCapRemain 27500mAh
+sim[0x12AC], sim[0x12AD] = 0, 54000                   -- SOCFullChargeCap 54000mAh
+sim[0x12B0], sim[0x12B1] = 0, 12                      -- SOCCycleCount 12
+sim[0x12B4], sim[0x12B5] = 1, 57920                   -- SOCCycleCap 123456mAh (0x0001E240)
+sim[0x12B8] = (100 << 8)                              -- SOCSOH 100%
+sim[0x12C0] = (1 << 8) | 1                            -- 充电/放电 MOS 均闭合
+sim[0x12C2] = 0
+
+local sim_mode = "ok"   -- "ok" = 正常应答；"exception" = 返回异常帧
+local requests = {}
+
+local real_uart_setup, real_uart_write = _G.uart.setup, _G.uart.write
+local jkmb
+_G.uart.setup = function(id, ...)
+    if id == JK_UART then
+        return true                 -- 让 jk_modbus 的轮询任务能打开串口
+    end
+    return real_uart_setup(id, ...)
+end
+_G.uart.write = function(id, data)
+    if not (id == JK_UART and #data == 8 and string.byte(data, 2) == 3) then
+        return real_uart_write(id, data)   -- 金箭从机的应答等其它链路照旧
+    end
+    requests[#requests + 1] = data
+    local addr  = string.byte(data, 1)
+    local start = (string.byte(data, 3) << 8) | string.byte(data, 4)
+    local num   = (string.byte(data, 5) << 8) | string.byte(data, 6)
+    local body
+    if sim_mode == "ok" then
+        local out = { string.char(addr, 3, num * 2) }
+        for i = 0, num - 1 do
+            local v = sim[start + i] or 0
+            out[#out + 1] = string.char((v >> 8) & 0xFF, v & 0xFF)
+        end
+        body = table.concat(out)
+    else
+        body = string.char(addr, 0x83, 0x02)   -- 异常响应：非法寄存器地址
+    end
+    local crc = jkmb.crc16(body)
+    jkmb.feed(body .. string.char(crc & 0xFF, (crc >> 8) & 0xFF))
+end
+
+jkmb = dofile(here .. "/../jk_modbus.lua")
+
+-- 5.2 CRC 与协议手册样例比对（CRC 低字节在前）
+check("CRC 01 03 0005 0002 = 0x0AD4", jkmb.crc16(from_hex("01 03 00 05 00 02")), 0x0AD4)
+check("CRC 01 03 04 11223344 = 0xC64B", jkmb.crc16(from_hex("01 03 04 11 22 33 44")), 0xC64B)
+
+-- 5.3 轮询任务：开串口 → 一轮 3 帧请求 → 发布 JK_ROUND
+pump()
+local s = jkmb.get_state()
+check("Modbus 收到一轮数据", s ~= nil, true)
+check("请求帧1 = 读 0x1200 x32", to_hex(requests[1] and requests[1]:sub(1, 6)), "010312000020")
+check("请求帧2 = 读 0x1240 x2", to_hex(requests[2] and requests[2]:sub(1, 6)), "010312400002")
+check("请求帧3 = 读 0x128A x58", to_hex(requests[3] and requests[3]:sub(1, 6)), "0103128a003a")
+do
+    local req = requests[3] or ""
+    local rc = jkmb.crc16(req:sub(1, 6))
+    check("请求帧 CRC 正确", string.byte(req, 7) == (rc & 0xFF)
+        and string.byte(req, 8) == ((rc >> 8) & 0xFF), true)
+end
+check("Modbus 串数(CellSta popcount)", s and s.cellCount, 20)
+check("Modbus 总电压 mV", s and s.batVolMv, 66070)
+check("Modbus 电流 mA(充电为正)", s and s.batCurrentMa, 3400)
+check("Modbus SOC", s and s.soc, 51)
+check("Modbus 单体1 mV", s and s.cells[1], 3304)
+check("Modbus 单体7 mV", s and s.cells[7], 3302)
+check("Modbus 单体20 mV", s and s.cells[20], 3304)
+check("Modbus 单体21 mV(空槽位)", s and s.cells[21], 0)
+check("Modbus 最大压差 mV", s and s.maxDiffMv, 2)
+check("Modbus 电池温度1 ℃", s and s.tempBatC, 32)
+check("Modbus 电池温度2 ℃", s and s.tempBat2C, 33)
+check("Modbus MOS 温度 ℃", s and s.tempMosC, 33)
+check("Modbus 均衡电流 mA", s and s.balanCurrentMa, 12)
+check("Modbus 均衡开关", s and s.balanceSw, 1)
+check("Modbus 充电 MOS", s and s.chargeMos, 1)
+check("Modbus 放电 MOS", s and s.dischargeMos, 1)
+check("Modbus 剩余容量 mAh", s and s.capRemainMah, 27500)
+check("Modbus 实际容量 mAh", s and s.fullCapMah, 54000)
+check("Modbus 循环次数", s and s.cycleCount, 12)
+check("Modbus 循环容量 mAh", s and s.cycleCapMah, 123456)
+check("Modbus SOH", s and s.soh, 100)
+check("Modbus 报警位图", s and s.sysAlarm, 0)
+check("Modbus 报警位图有效", s and s.sysAlarmValid, true)
+check("Modbus 数据源标记", s and s.source, "modbus")
+check("Modbus 统计轮数", jkmb.get_stats().rounds, 1)
+check("Modbus 已发请求数(3 块)", jkmb.get_stats().requests, 3)
+check("Modbus 无超时", jkmb.get_stats().timeouts, 0)
+check("Modbus 无 CRC 错误", jkmb.get_stats().bad_crc, 0)
+check("Modbus 数据新鲜", jkmb.is_fresh(), true)
+
+-- 5.4 从机返回异常码 → 本轮失败、不产生新样本、保留上一轮快照
+do
+    local before_rounds = jkmb.get_stats().rounds
+    sim_mode = "exception"
+    sys.taskInit(function() jkmb.poll_once() end)
+    pump()
+    check("异常响应不产生新轮次", jkmb.get_stats().rounds, before_rounds)
+    check("异常响应计入失败轮数", jkmb.get_stats().cycles_failed >= 1, true)
+    check("异常后保留上一轮快照", jkmb.get_state().cellCount, 20)
+    sim_mode = "ok"
+end
+
+-- 5.4.1 没有请求在途时收到的帧（迟到/噪声）直接丢弃，不会被配给下一个请求
+do
+    local before = jkmb.get_stats().late_frames
+    local body = string.char(0x01, 0x03, 0x02, 0x12, 0x34)
+    local crc = jkmb.crc16(body)
+    jkmb.feed(body .. string.char(crc & 0xFF, (crc >> 8) & 0xFF))
+    check("空闲时收到的帧计为迟到", jkmb.get_stats().late_frames, before + 1)
+end
+
+-- 5.5 报警位映射（bit8 充电过温）与金箭从机联动
+do
+    sim[0x12A0], sim[0x12A1] = 0, 0x0100      -- bit8 充电过温保护
+    sys.taskInit(function() jkmb.poll_once() end)
+    pump()
+    local s2 = jkmb.get_state()
+    check("报警 bit8 → sysAlarm", s2 and s2.sysAlarm, 0x0100)
+    check("报警 bit8 → alarms[5](电池过温)", s2 and s2.alarms[5], 1)
+    check("报警位置位 → warn=1", s2 and s2.warn, 1)
+
+    -- 同一份快照喂给金箭从机：寄存器与开关量与显示屏协议一致可读
+    package.loaded["jk"] = jkmb
+    local jj2 = dofile(here .. "/../jinjian_slave.lua")
+    local resp = jj2.handle_frame(build_frame("01 03 00 00 00 09"))
+    local function reg2(a) return (string.byte(resp, 4 + a * 2) << 8) | string.byte(resp, 5 + a * 2) end
+    check("金箭 reg0 总电压(0.01V)", reg2(0), 6607)
+    check("金箭 reg1 串数", reg2(1), 20)
+    check("金箭 reg2 SOC", reg2(2), 51)
+    check("金箭 reg3 容量 Ah", reg2(3), 54)
+    check("金箭 reg5 电流(0.01A)", reg2(5), 340)
+    check("金箭 reg8 板温", reg2(8), 33)
+    do
+        local r = jj2.handle_frame(build_frame("01 03 00 68 00 01"))   -- reg104 循环次数
+        check("金箭 reg104 循环次数(来自 Modbus)", (string.byte(r, 4) << 8) | string.byte(r, 5), 12)
+    end
+    do
+        local r = jj2.handle_frame(build_frame("01 01 00 04 00 05"))   -- 保护开关量 4-8
+        check("金箭开关量 4-8(仅过温充电置位)", string.byte(r, 4), 0x02)
+    end
+end
+
+-- 5.5.1 原始帧十六进制日志限频（LOG_RAW_FRAMES 打开时每 LOG_HEX_EVERY_N 帧打一次）
+do
+    local saved_info = _G.log.info
+    local hex_lines = 0
+    _G.log.info = function(tag, ...)
+        if tag == "jkmb.raw" then
+            hex_lines = hex_lines + 1
+            return
+        end
+        return saved_info(tag, ...)
+    end
+    cfg_mb.LOG_RAW_FRAMES = true
+    for _ = 1, 3 do                       -- 3 轮 = 9 帧请求 = 18 次 hex 打印机会
+        sys.taskInit(function() jkmb.poll_once() end)
+        pump()
+    end
+    check("原始帧 hex 每 N 帧只打一次", hex_lines, 1)
+    cfg_mb.LOG_RAW_FRAMES = false
+    _G.log.info = saved_info
+end
+
+-- 5.6 收尾：还原串口打桩、停止 Modbus 轮询任务
+jkmb.stop()
+_G.uart.setup = real_uart_setup
+_G.uart.write = real_uart_write
+
+--=============================================================================
+-- 6. 串口回调只收字节 + 独立解析任务（回调里不做重活的实现验证）
+--=============================================================================
+io.write("== 接收回调与解析任务拆分 ==\n")
+
+local saved_uart = { setup = _G.uart.setup, on = _G.uart.on, read = _G.uart.read,
+                     write = _G.uart.write }
+local handlers, rxq = {}, ""
+local written = {}
+_G.uart.on = function(id, _evt, cb) handlers[id] = cb end
+_G.uart.read = function(_id, _len)
+    local s = rxq
+    rxq = ""
+    return s
+end
+_G.uart.write = function(id, data) written[#written + 1] = { id = id, data = data } end
+_G.uart.setup = function(id) return id == JK_UART or id == cfg_mb.JJ_UART_ID end
+
+-- 6.1 金箭从机：回调只搬字节，帧扫描与应答由解析任务完成
+do
+    local jj3 = dofile(here .. "/../jinjian_slave.lua")
+    pump()   -- 打开串口 → 注册接收回调 → 进入等待
+    check("金箭接收回调已注册", handlers[cfg_mb.JJ_UART_ID] ~= nil, true)
+
+    rxq = build_frame("01 03 00 00 00 09")
+    handlers[cfg_mb.JJ_UART_ID](cfg_mb.JJ_UART_ID)   -- 模拟串口中断：只搬运字节
+    check("回调本身不应答", #written, 0)
+    pump()                                            -- 解析任务被 JJ_RX 事件唤醒
+    check("解析任务发出应答", #written, 1)
+    check("应答功能码 01 03", written[1] and to_hex(written[1].data:sub(1, 2)), "0103")
+    check("应答字节数 18", written[1] and string.byte(written[1].data, 3), 18)
+end
+
+-- 6.2 突发帧流按预算分批处理（每 JJ_PARSE_MAX_FRAMES 帧主动让出一次）
+do
+    local req = build_frame("01 03 00 00 00 09")
+    local before = #written
+    rxq = string.rep(req, 12)
+    handlers[cfg_mb.JJ_UART_ID](cfg_mb.JJ_UART_ID)
+    pump()
+    check("突发帧先处理一批(预算 8)", #written - before, 8)
+    scheduler.wake()   -- 模拟 wait(1) 到期，继续处理剩余帧
+    pump()
+    check("让出后处理完剩余帧", #written - before, 12)
+end
+
+-- 6.3 极空显示屏：回调只搬字节，整轮解析由解析任务完成
+do
+    local jk5 = dofile(here .. "/../jk_display.lua")
+    pump()   -- 打开串口 → 注册接收回调 → 进入等待
+    check("极空接收回调已注册", handlers[cfg_mb.JK_UART_ID] ~= nil, true)
+
+    rxq = round
+    handlers[cfg_mb.JK_UART_ID](cfg_mb.JK_UART_ID)
+    check("回调本身不解析", jk5.get_state(), nil)
+    pump()
+    local s5 = jk5.get_state()
+    check("解析任务产出快照", s5 ~= nil and s5.cellCount, 20)
+    check("解析任务与直接喂帧结果一致", s5 and s5.batVolMv, 66070)
+end
+
+-- 6.4 收尾：还原串口打桩
+_G.uart.setup, _G.uart.on, _G.uart.read, _G.uart.write =
+    saved_uart.setup, saved_uart.on, saved_uart.read, saved_uart.write
 
 --=============================================================================
 -- 汇总
