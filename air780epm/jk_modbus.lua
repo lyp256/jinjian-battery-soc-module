@@ -1,6 +1,6 @@
 --[[
 @module  jk_modbus
-@summary 极空(JK) BMS RS485 Modbus 通用协议主站采集（RS4851 / 串口1）
+@summary 极空(JK) BMS RS485 Modbus 通用协议主站采集（RS485-3 / UART3）
 @version 1.0
 @date    2026.10.08
 @usage
@@ -26,6 +26,7 @@
       0x12B0        SOCCycleCount 循环次数（UINT32）
       0x12B4        SOCCycleCap 循环总容量（UINT32，mAh）
       0x12B8        [高字节]SOCSOH / [低字节]Precharge
+      0x12BC        RunTime BMS 运行时间（UINT32，秒）
       0x12C0        [高字节]充电状态 / [低字节]放电状态
 
   注：协议手册 §6.3 的“单体电压”表把偏移写成了字节偏移（0/2/4…），其余表是寄存器偏移，
@@ -44,10 +45,11 @@
 每完成一轮完整轮询（单体电压 + 电池状态 + 汇总三块全部成功）发布一次 "JK_ROUND"，
 携带本轮 state，供 bms_uplink 按“一轮一条样本”的粒度入队；state 字段与 jk_display
 保持同名字段（batVolMv/batCurrentMa/soc/cells/tempBatC/tempMosC/fullCapMah/…），
-并额外提供 modbus 独有字段（tempBat2C/balanCurrentMa/cycleCount/soh/…）。
+并额外提供 modbus 独有字段（tempBat2C/balanCurrentMa/cycleCount/soh/bmsUpTimeS/…）。
 ]]
 
 local cfg = require "config"
+local uart_pins = require "uart_pins"
 local M = {}
 
 -- 单体槽位上限（0x1200 起连续 32 个寄存器）
@@ -78,6 +80,7 @@ local ST_FULLCAP_HI, ST_FULLCAP_LO     = 35, 36 -- 0x12AC
 local ST_CYCLE_HI,   ST_CYCLE_LO       = 39, 40 -- 0x12B0
 local ST_CYCLE_CAP_HI, ST_CYCLE_CAP_LO = 43, 44 -- 0x12B4
 local ST_SOH_PREC                      = 47     -- 0x12B8
+local ST_RUNTIME_HI, ST_RUNTIME_LO     = 51, 52 -- 0x12BC BMS 运行时间（秒，u32）
 local ST_CHARGE_STA                    = 55     -- 0x12C0
 local ST_USER_ALARM2                   = 57     -- 0x12C2
 
@@ -366,6 +369,7 @@ local function build_state(cells, cell_stats, st)
     local cap_remain  = s32(st, ST_CAPREM_HI, ST_CAPREM_LO)
     local cycle_cnt   = u32(st, ST_CYCLE_HI, ST_CYCLE_LO)
     local cycle_cap   = u32(st, ST_CYCLE_CAP_HI, ST_CYCLE_CAP_LO)
+    local run_time    = u32(st, ST_RUNTIME_HI, ST_RUNTIME_LO)
     local balan       = ((st[ST_BAL_SOC] or 0) >> 8) & 0xFF
     local soc         = (st[ST_BAL_SOC] or 0) & 0xFF
     local soh         = ((st[ST_SOH_PREC] or 0) >> 8) & 0xFF
@@ -463,6 +467,7 @@ local function build_state(cells, cell_stats, st)
         balanCurrentMa  = balan_ma,       -- 均衡电流 mA（显示屏协议没有）
         cycleCount      = cycle_cnt > 0xFFFF and 0xFFFF or cycle_cnt,
         cycleCapMah     = cycle_cap,
+        bmsUpTimeS      = run_time,       -- 0x12BC RunTime（BMS 上电秒数，显示屏协议没有）
         soh             = soh,
         cellMaxMv       = max_mv,
         cellMinMv       = min_mv,
@@ -526,6 +531,8 @@ local function open_uart()
     if not uart or not uart.setup then
         return false
     end
+    -- UART3 不是默认复用功能：先把 PIN53/PIN52 设成 UART3_RXD/TXD 再开串口（见 uart_pins.lua）
+    uart_pins.mux(cfg.JK_UART_ID, cfg.JK_PIN_RX, cfg.JK_PIN_TX, "jk")
     local dir = cfg.JK_RS485_DIR_GPIO or 0xFFFFFFFF
     if not uart.setup(UART_ID, cfg.JK_MODBUS_BAUD, 8, 1, uart.NONE,
             uart.LSB, cfg.JK_MODBUS_RX_BUFF_SIZE, dir,

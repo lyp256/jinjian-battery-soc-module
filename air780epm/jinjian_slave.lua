@@ -6,7 +6,9 @@
 @usage
 金箭中控/仪表作为 Modbus 主站，9600 8N1 周期轮询本模块（从站地址 1）。
 协议依据 docs/jinjian/02_BMS_PROTOCOL.md 与 docs/jinjian/03_BMS_COLLECTION_REPORT.md，
-寄存器 ← 极空数据的映射与 ESP32 侧实现保持一致：
+寄存器 ← 共享缓存（bms_cache）里「规范样本」的映射，与 ESP32 侧实现保持一致。
+数据来源是 bms_data 归一后的样本，因此极空两套协议（显示屏广播 / RS485 Modbus）都适用：
+缓存为空（还没收到一轮数据）时按全 0 应答，不会崩溃也不会不应答。
 
   寄存器(03)：
     0     总电压     极空总压 mV / 10          → 0.01V
@@ -40,7 +42,7 @@
 ]]
 
 local cfg = require "config"
-local jk = require "jk"          -- 极空数据源（显示屏广播 / RS485 Modbus，按 config 选择）
+local bms_cache = require "bms_cache" -- 共享缓存（bms_data 写入的规范样本，只读）
 local board = require "board"
 
 local M = {}
@@ -125,6 +127,7 @@ local cache = {
 }
 
 local stats = {
+    rx_bytes = 0,    -- 串口收到的原始字节数（0 = 中控那一路一个字节都没进来）
     rx_frames = 0,   -- 收到且 CRC 正确的请求帧数（含其它从站地址的帧）
     tx_frames = 0,   -- 发出的响应帧数
     queries = 0,     -- 收到中控的 BMS 查询/请求次数（从站地址匹配本机）
@@ -171,6 +174,12 @@ end
 --=============================================================================
 -- 金箭寄存器 ← 极空数据
 --=============================================================================
+
+-- 最近一条规范样本（缓存为空返回 nil → 全部按 0 应答）
+local function sample()
+    return bms_cache.latest()
+end
+
 local function to_i16(v)
     v = math.floor(v + 0.5) & 0xFFFF
     if v >= 0x8000 then
@@ -190,7 +199,7 @@ local SA_MOS_OVER_T = 0x0002 -- bit1  MOS 过温
 -- 保护状态：[1] 短路 [2] 过温充电 [3] 过温放电 [4] 低温充电 [5] 低温放电
 -- 优先用完整 sysAlarm 位图；本轮缺扩展块时退回 9 个图标字段 + 温度阈值
 local function protection_bits()
-    local s = jk.get_state()
+    local s = sample()
     local bits = { 0, 0, 0, 0, 0 }
     if not s then
         return bits
@@ -217,15 +226,15 @@ local function protection_bits()
     bits[2] = over_temp_charge and 1 or 0
     bits[3] = over_temp_discharge and 1 or 0
     -- 低温充电：位图有专用位；无位图时用温度阈值兜底
-    bits[4] = (low_temp_charge or s.tempBatC <= cfg.JJ_LOW_TEMP_CHARGE_C) and 1 or 0
+    bits[4] = (low_temp_charge or s.tempBat1C <= cfg.JJ_LOW_TEMP_CHARGE_C) and 1 or 0
     -- 低温放电：位表里没有专用位，仍由温度阈值推导
-    bits[5] = (s.tempBatC <= cfg.JJ_LOW_TEMP_DISCHARGE_C) and 1 or 0
+    bits[5] = (s.tempBat1C <= cfg.JJ_LOW_TEMP_DISCHARGE_C) and 1 or 0
     return bits
 end
 
 -- 是否处于快充（充电中且电流达到阈值，且主站没有下过"结束快充"）
 local function fast_charging()
-    local s = jk.get_state()
+    local s = sample()
     if not s then
         return 0
     end
@@ -241,7 +250,7 @@ end
 
 -- 读单个寄存器；返回 nil 表示地址非法（异常码 02）
 local function reg_value(addr)
-    local s = jk.get_state()
+    local s = sample()
     local cellCount = math.min(s and s.cellCount or 0, JJ_MAX_CELLS)
 
     if addr == 0 then                                     -- 总电压 0.01V
@@ -253,14 +262,14 @@ local function reg_value(addr)
         if soc < 0 then soc = 0 elseif soc > 100 then soc = 100 end
         return soc
     elseif addr == 3 then                                 -- 容量 Ah
-        return s and math.floor(s.fullCapMah / 1000 + 0.5) or 0
+        return s and math.floor(s.socFullChargeCapMah / 1000 + 0.5) or 0
     elseif addr == 4 then                                 -- 短路保护（模拟量块）
         return protection_bits()[1]
     elseif addr == 5 then                                 -- 充电电流 0.01A
         if not s then return 0 end
         return to_i16(s.batCurrentMa / 10)
     elseif addr == 6 or addr == 7 then                    -- 电池温度 2 / 1
-        return to_i16(s and s.tempBatC or 0)
+        return to_i16(s and s.tempBat1C or 0)
     elseif addr == 8 then                                 -- 板温
         return to_i16(s and s.tempMosC or 0)
     elseif addr >= 9 and addr <= 32 then                  -- 单体电压 mV
@@ -272,15 +281,15 @@ local function reg_value(addr)
     elseif addr == 103 then                               -- 电池类型
         return cfg.JJ_BATTERY_TYPE
     elseif addr == 104 then                               -- 循环次数
-        -- Modbus 数据源能读到极空 SOCCycleCount，显示屏广播没有则用本地缓存
-        if s and s.cycleCount then
+        -- Modbus 数据源能读到极空 SOCCycleCount（display 归一后恒为 0），读不到用本地缓存
+        if s and (s.cycleCount or 0) > 0 then
             return s.cycleCount
         end
         return cache.cycleCount
     elseif addr == 110 then                               -- 均衡状态
         return (s and s.balanceSw == 1) and 1 or 0
     elseif addr == 113 then                               -- 标称容量 Ah
-        return s and math.floor(s.fullCapMah / 1000 + 0.5) or 0
+        return s and math.floor(s.socFullChargeCapMah / 1000 + 0.5) or 0
     elseif addr >= 105 and addr <= 109 or addr == 111 or addr == 112 then
         return 0
     elseif addr >= 1000 and addr <= 1007 then             -- PN（每寄存器 2 ASCII）
@@ -499,6 +508,7 @@ local function on_receive(id)
         s = uart.read(id, 128)
         if s and #s > 0 then
             rx = rx .. s
+            stats.rx_bytes = stats.rx_bytes + #s
         end
     until not s or #s == 0
 

@@ -7,18 +7,14 @@
 本文件集中存放所有可调参数，其它模块通过 require "config" 读取。
 修改参数后重新烧录脚本即可生效（本工程没有 RPC/Web 配置通道）。
 
-仓库存档说明（config.lua.tpl）：
-  本文件是提交到仓库的配置模板，已剥离敏感信息（MQTT 服务器/账号/密码）。
-  本地使用时复制为 config.lua（air780epm/.gitignore 已忽略该文件）再填真实值；
-  真实主机名、账号、密码只写在 config.lua，禁止提交到仓库。
-
 硬件资源（银尔达 D700Tm / Air780EPM）：
-  RS4851 = 串口1，方向控制 EN = GPIO25
-  RS4852 = 串口2
-  RS4853 = 串口3
+  RS4851 = 串口1（UART1，默认复用），方向控制 EN = GPIO25 → 管理链路（裸帧 RPC）
+  RS4852 = 串口2（UART2，默认复用，自动方向）  → 金箭中控 Modbus RTU 从机
+  RS4853 = 串口3（UART3，需 pins.setup，自动方向）→ 极空 BMS 数据源（显示屏广播 / Modbus 主站）
   NET LED = GPIO27（输出，高电平亮）
   Reload 按键 = GPIO30（输入上拉，按下接 GND）
-  硬件看门狗 = GPIO28（air153C_wtd）
+  硬件看门狗 = GPIO28 → Air153C/Air153D 的 WTDOG（air153C_wtd：开机喂一次 +
+               每 30s 一个 400ms 正脉冲；实测 exair153x_wdt 喂不动本板，见 README §8）
   可控电压输出 = GPIO21，输出使能 = GPIO22
   供电电压采集 = ADC0（0-90V，电压 = ADC 电压 * 273300 / 3300）
 ]]
@@ -26,7 +22,7 @@
 local M                        = {}
 
 --=============================================================================
--- 极空 BMS 数据源协议选择（RS4851 / 串口1）
+-- 极空 BMS 数据源协议选择（RS485-3 / UART3）
 --   极空保护板对外有两套协议，本项目二选一（同一根 485 线、同一份快照）：
 --     "display" = 显示屏接口广播协议：2400 8N1 单向广播，只收不发（默认）；
 --     "modbus"  = RS485 Modbus 通用协议：115200 8N1 主从应答，本机做主站轮询，
@@ -39,14 +35,16 @@ M.JK_PROTOCOL                  = "display" -- "display" 显示屏广播（只收
 --=============================================================================
 -- 极空显示屏广播参数（JK_PROTOCOL = "display" 时生效）
 --   极空保护板"显示屏接口"以 2400 8N1 持续单向广播（一轮 ≈ 2.17s），
---   本模块只接收、不发送，因此只需把方向脚固定在接收态。
+--   本模块只接收、不发送（本板 RS485-3 是自动方向收发器，不用方向脚）。
 --   轮字节数随固件/串数变化（20 串 = 364 字节；≥25 串会多发一条 0x2011 第 25 节
 --   电压帧，每轮多 9 字节；报警时轮尾还会出现 0x80/0x02 蜂鸣器帧），
 --   解析一律按帧内 LEN 定界，不写死轮长。
 --=============================================================================
-M.JK_UART_ID                   = 1     -- 串口编号（RS4851 = 串口1）
+M.JK_UART_ID                   = 3     -- 串口编号（RS485-3 = 串口3）
+M.JK_PIN_RX                    = 53    -- UART3_RXD（UART3 不是默认复用功能，开机由 uart_pins 复用）
+M.JK_PIN_TX                    = 52    -- UART3_TXD（同上；合宙官方 demo 的 57/58 是开发板 V1.3 的脚，本板没接）
 M.JK_BAUD                      = 2400  -- 显示屏协议固定 2400 8N1
-M.JK_RS485_DIR_GPIO            = 25    -- RS4851 EN（GPIO25）；自动方向收发器填 nil
+M.JK_RS485_DIR_GPIO            = nil   -- RS485-3 是自动方向收发器，无方向脚（驱动按 0xFFFFFFFF 处理）
 M.JK_RS485_RX_LEVEL            = 0     -- 接收方向电平
 M.JK_RS485_DELAY_US            = 20000 -- 发送->接收切换延时（纯接收链路用不到）
 M.JK_RX_BUFF_SIZE              = 2048  -- 串口接收缓冲区
@@ -93,56 +91,125 @@ M.JJ_LOW_TEMP_CHARGE_C         = 0   -- 电池温度 <= 该值 → 低温充电�
 M.JJ_LOW_TEMP_DISCHARGE_C      = -20 -- 电池温度 <= 该值 → 低温放电保护
 
 --=============================================================================
--- MQTT 上报（4G 通道）
---   只做压缩上报，无 RPC。
---   MQTT_HOST 留空（"" 或 nil）表示本机不接 4G 上报：
---   此时 bms_uplink 只打印一次提示，不启动采样组批、不建 MQTT 连接、
---   也不占用 JK_ROUND 事件，其它功能（极空采集、金箭从机）不受影响。
+-- 管理链路（RS485-1 / UART1）：裸帧 RPC（状态 / 配置 / 命令 / FOTA）
+--   一个统一管理服务（mgmt.lua）+ 两条传输：UART1 走自定义裸帧（二进制帧头 + JSON 载荷 +
+--   二进制 BLOB 分块），MQTT 走 JSON-RPC（主题后缀 rpc）。两条传输共用同一套方法、字段与
+--   错误码，**没有寄存器表/从站地址**（RS485-1 是一对一专用线，无需寻址）。
+--   帧格式（双向同一套）：
+--     SOF(2)=A5 5A | VER(1)=01 | TYPE(1: 1 REQ / 2 RESP / 3 EVT / 4 BLOB) | ID(1) |
+--     LEN(2, 小端) | PAYLOAD | CRC16(2, 0xA001 低字节在前，覆盖 VER..PAYLOAD)
+--     REQ  = {"method","params"}；RESP = {"ok":true,"result":{…}} / {"ok":false,"error":{…}}
+--     EVT  = {"evt":"hello|fota","data":{…}}；BLOB = SEQ(2 LE) | LEN(2 LE) | DATA
+--   协议详情与 PC 验收见 README §7 与 docs/air780epm/MGMT_RPC.md。
+--   引脚：本板 RS485-1 接的是 UART1（PIN18=UART1_TXD、PIN17=UART1_RXD，默认复用功能，
+--     不用 pins.setup）；方向脚 EN = GPIO25，必须显式交给 uart.setup 控制（见 README §2.1）。
+--   ⚠ RS485-1 少了方向控制会完全收发不了；GPIO 高电平还必须拉到 3.3V（board.lua 开机第一件事）。
 --=============================================================================
-M.MQTT_HOST                    = "" -- MQTT 服务器地址；留空（"" 或 nil）= 关闭 4G 上报；本地真实地址填在 config.lua
+M.MGMT_UART_ID                 = 1     -- 串口编号（RS485-1 = 串口1）
+M.MGMT_BAUD                    = 115200 -- 管理链路波特率（[R]，改后需重启）
+M.MGMT_PIN_RX                  = nil   -- UART1 是默认复用功能（PIN17=UART1_RXD），不用 pins.setup
+M.MGMT_PIN_TX                  = nil   -- UART1 是默认复用功能（PIN18=UART1_TXD），不用 pins.setup
+M.MGMT_RS485_DIR               = 25    -- 方向脚：RS485-1 EN = GPIO25（必须显式控制；自动方向收发器填 nil）
+M.MGMT_RS485_RX_LEVEL          = 0     -- 接收方向电平（仅 DIR 有效时用）
+M.MGMT_RS485_DELAY_US          = 20000 -- 发送→接收切换延时（仅 DIR 有效时用）
+M.MGMT_RX_BUFF_SIZE            = 2048  -- 串口接收缓冲区（帧 ≤ 1200 字节，留余量）
+M.MGMT_MAX_FRAME_LEN           = 1200  -- 单帧最大长度（8 头 + 1024 JSON + 2 CRC，超出即丢弃重同步）
+M.MGMT_MAX_PAYLOAD             = 1024  -- JSON 载荷上限（帧头 LEN 字段的理论上限是 65535）
+M.MGMT_PARSE_MAX_FRAMES        = 8     -- 解析任务单次最多处理多少帧后主动让出
+M.MGMT_SNAP_TTL_MS             = 1000  -- 状态快照缓存时间（同一时刻只采样一次）
+M.MGMT_SLOW_REFRESH_MS         = 5000  -- 慢外设（供电电压 ADC / PN 的 IMEI）后台刷新周期
+M.MGMT_DEDUP_WINDOW_MS         = 10000 -- 同一 ID + 方法在此窗口内重复到达 → 重放缓存响应（不重复执行）
+M.MGMT_FOTA_ENABLE             = true  -- 允许下发 URL 触发 FOTA（固件需带 libfota2）
+M.MGMT_FOTA_NET_WAIT_MS        = 300000 -- 等联网的上限（超时置 FOTA 失败）
+-- 本地 FOTA（主站经 BLOB 帧 / MQTT fota.chunk 分段上传升级包，核心库 fota 直接写 Flash）：
+--   不联网、不落文件；收齐后只置「成功待重启」，由主站下发现有重启命令。见 README §7.5。
+M.MGMT_FOTA_LOCAL_ENABLE       = true   -- 允许本地（分段上传）FOTA
+M.MGMT_FOTA_LOCAL_TIMEOUT_MS   = 60000  -- 空闲超时：这么久没有新数据块 → fota.finish(false) 取消
+M.MGMT_FOTA_LOCAL_FINALIZE_MS  = 3000   -- 收齐后等核心库写 Flash（fota.isDone）的上限
+M.MGMT_FOTA_LOCAL_WAIT_MS      = 3000   -- fota.init 后轮询 fota.wait() 等底层就绪的上限（超时只告警继续）
+-- 管理链路 MQTT JSON-RPC：与 UART1 并列的第二条管理传输，方法/字段完全一致，通道由**主题后缀**
+-- 标识（与上报通道 status 并列）：
+--   下行（主站→设备）<prefix>/<device_id>/<MGMT_MQTT_SUFFIX>       载荷 = {"id",...,"method","params"}
+--   上行（设备→主站）<prefix>/<device_id>/<MGMT_MQTT_SUFFIX>/resp  载荷 = {"id",...,"ok",...}
+-- 与 4G 上报共用同一条 MQTT 连接（clientId = username = IMEI，同 broker 只允许一条连接），
+-- 所以 MQTT_HOST 未配置时本通道自动不启动（UART1 裸帧 RPC 不受影响）。MQTT 纯请求-应答、不发事件。
+M.MGMT_MQTT_ENABLE             = true  -- 启用管理 MQTT JSON-RPC（需同时配置 MQTT_HOST）
+M.MGMT_MQTT_SUFFIX             = "rpc" -- 通道后缀（主题最后一段）：.../<device_id>/rpc
+M.MGMT_MQTT_MAX_FRAMES         = 8     -- 单条 MQTT 载荷最多解析多少个 JSON-RPC 请求（防畸形包）
+
+--=============================================================================
+-- 【临时诊断】管理总线（RS485-1 / UART1）回环 + 心跳（排查"这一路到底通不通"时用，
+--   生产必须 false）。打开后 UART1 不跑管理 RPC，改成"收到什么原样回什么 +
+--   每 N ms 一行心跳"（`[mg echo] 2026-10-14 16:20:00 #12`）。引脚复用与 uart.setup
+--   和 RPC 完全一致，所以它只测电气层：收到心跳 = 模组→PC 通；发什么回什么 = PC→模组 通。
+--   排查完请改回 false（回环与 RPC 不能同时开：同一时刻只有一个 UART1 写入者）。
+--=============================================================================
+M.MGMT_ECHO_TEST               = false -- 【临时诊断】true = 回环+心跳；生产 = false
+M.MGMT_ECHO_HEARTBEAT_MS       = 5000  -- 诊断心跳周期（毫秒）
+
+--=============================================================================
+-- 运行期配置持久化（fskv）：管理链路（UART1 RPC / MQTT RPC）写下的配置项重启后仍生效
+--   CFG_STORE_ENABLE = false 时完全不读写 fskv（等价"每次重启都回 config.lua"）。
+--   存的是「覆盖项」JSON 文本，不是整份 config：未知键/非法值在开机加载时跳过并记日志。
+--   恢复出厂命令（方法 cmd.factory_reset）会清掉这份覆盖，重启后回默认值。
+--=============================================================================
+M.CFG_STORE_ENABLE             = true    -- 是否启用配置持久化（fskv 不可用时自动降级为不持久化）
+M.CFG_STORE_FSKV_KEY           = "jjcfg" -- fskv 键名
+
+--=============================================================================
+-- MQTT 上报（4G 通道）：MessageV1 压缩上报；管理 JSON-RPC 复用这条连接（见 MGMT_MQTT_*）
+--   MQTT_HOST 留空（"" 或 nil）表示本机不接 4G 上报：不建 MQTT 连接、不上报，
+--   其它功能（极空采集、共享缓存、金箭从机、UART1 管理 RPC）完全不受影响。
+--   鉴权：clientId = 用户名 = IMEI，密码 = HMAC-SHA256(MQTT_HMAC_SECRET, IMEI) 小写 hex；
+--   MQTT_HMAC_SECRET 换值即换密钥（服务端需同步改）。
+--=============================================================================
+M.MQTT_HOST                    = "" -- MQTT 服务器地址；留空 = 关闭 4G 上报
 M.MQTT_PORT                    = 1883
 M.MQTT_IS_SSL                  = false
-M.MQTT_USER                    = "" -- 本地真实账号填在 config.lua，禁止提交
-M.MQTT_PASSWORD                = "" -- 本地真实密码填在 config.lua，禁止提交
-M.MQTT_TOPIC_PREFIX            = "/bms" -- 上报主题 = <prefix>/<device_id>/status
+M.MQTT_HMAC_SECRET             = "soc" -- 密码 = HMAC-SHA256(本值, IMEI) 小写 hex
+M.MQTT_TOPIC_PREFIX            = "/device" -- 上报主题 = <prefix>/<device_id>/status
 M.MQTT_QOS                     = 0      -- QoS0，偶发丢包可接受
 M.MQTT_KEEPALIVE_S             = 120    -- 心跳周期（秒）
 M.MQTT_RECONN_MS               = 3000   -- 断线自动重连间隔
 M.MQTT_CONNACK_TIMEOUT_MS      = 60000  -- 单次等待 CONNACK 上限
 
--- 上报批次：每批 BATCH_SAMPLES 条样本，样本粒度 = 极空一轮广播（≈2.17s）。
--- 14 × 2.17s ≈ 30s，即"每 30 秒聚合上报一包"。
-M.BATCH_SAMPLES                = 14 -- 一批样本数（= 一轮广播一条样本）
+--=============================================================================
+-- NTP 对时（上报的 BaseTimestamp / Time 列依赖）
+--   联网后立即对时一次，成功后每 NTP_SYNC_INTERVAL_MS 对时一次；失败按 NTP_RETRY_MS 重试。
+--   未对时前 bms_uplink 不发布（时间列不可信）。
+--=============================================================================
+M.NTP_SERVER                   = "ntp.aliyun.com" -- 也可填 "ntp.ntsc.ac.cn" 等
+M.NTP_SYNC_TIMEOUT_MS          = 5000             -- 单次同步等待上限（毫秒）
+M.NTP_SYNC_INTERVAL_MS         = 3600 * 1000      -- 成功后对时周期（默认 1 小时）
+M.NTP_RETRY_MS                 = 10 * 1000        -- 失败后重试间隔（毫秒）
+
+--=============================================================================
+-- 共享采样缓存（bms_cache）与上报周期
+--   缓存条数：采集适配层（bms_data）写入、金箭从机与上报只读的环形缓冲。
+--   display 一轮 ≈2.17s（32 条 ≈69s）、modbus 一轮 1s（32 条 ≈32s），都能覆盖 30s 上报窗口
+--   并在消费端偶发卡顿时留余量；改大会多占内存（一条 ≈32 路单体 + 20 个标量）。
+--   上报周期：每 REPORT_PERIOD_MS 把「本轮新到达的真实样本」编码上报；窗口内没有新样本时
+--   发 13 字节 0 样本帧（MessageV1 flags bit10），不补零/不插值/不沿用旧值冒充采集数据。
+--=============================================================================
+M.BMS_CACHE_SAMPLES            = 32    -- 共享缓存条数（环形，覆盖不了就计入上报 lost）
+M.REPORT_PERIOD_MS             = 30000 -- 上报周期（毫秒），默认 30s
 
 -- 压缩编码分片让出：编码是纯 CPU 计算，每编码若干列主动让出一次，
 -- 避免长 CPU 段挤占串口收发（0 / nil = 不让出，离线自测用）
 M.ENCODE_YIELD_MS              = 1
 
--- 上报周期：与采集解耦，无论是否采集到极空数据，每 REPORT_PERIOD_MS 都上报一包；
--- 采集不到数据（极空无广播/未接入）时用兜底样本填充，保证按时上报不中断。
-M.REPORT_PERIOD_MS             = 30000 -- 上报周期（毫秒），默认 30s（≈14 条广播）
-M.REPORT_HOLD_LAST             = true  -- 兜底样本取值：true=沿用最近一次极空快照，false=全 0
-
--- 电池串数：0 = 按广播自动识别（推荐）；>0 = 固定串数（覆盖自动识别）
+-- 电池串数：0 = 按极空数据自动识别（推荐）；>0 = 固定串数（覆盖自动识别）
 M.CELL_COUNT                   = 0
 
 --=============================================================================
 -- 板级资源（银尔达 D700Tm）
 --=============================================================================
-M.NET_LED_GPIO                 = 27            -- 网络指示灯，高电平亮
-M.RELOAD_KEY_GPIO              = 30            -- Reload 按键，输入上拉，按下接 GND
-M.RELOAD_KEY_REBOOT_MS         = 3000          -- 长按多久后重启模组
-M.WDT_GPIO                     = 28            -- 硬件看门狗（air153C_wtd）
-M.WDT_FEED_INTERVAL_MS         = 150000        -- 喂狗周期（README 建议 150 秒）
-M.POWER_OUT_EN_GPIO            = 22            -- 可控电压输出使能脚
-M.POWER_OUT_GPIO               = 21            -- 可控电压输出脚
-M.POWER_OUT_ON_BOOT            = true          -- 开机是否自动打开可控电压输出
-M.POWER_OUT_SETTLE_MS          = 5             -- 使能->输出->释放使能 之间的延时（README: 5ms）
-M.ADC_SUPPLY_CHANNEL           = 0             -- 供电电压采集 = ADC0
-M.ADC_SUPPLY_SCALE             = 273300 / 3300 -- 电压(mV) = ADC 电压(mV) * scale
-M.ADC_SUPPLY_SAMPLES           = 3             -- 单次读取采样次数（每次 adc.get 是同步转换，
-                                               -- 逐次让出，避免一次读太多次占住调度器）
-M.SUPPLY_REPORT_MS             = 60000         -- 供电电压打印周期
+--   引脚/外设固定（NET LED GPIO27、Reload 按键 GPIO30、看门狗 GPIO28 → Air153C/Air153D
+--   的 WTDOG、可控电压输出 GPIO21+GPIO22、供电电压 ADC0、引脚复用表 pins_Air780EPM.json），
+--   全部硬编码在 board.lua 顶部的 HW 表里，这里不再提供开关（引脚复用表路径也写死在
+--   board.lua：/luadb/pins_Air780EPM.json）。
+--   要调板级参数（喂狗周期 WTD_FEED_MS、长按时长 RELOAD_REBOOT_MS、采样次数 ADC_SAMPLES
+--   等）改 board.lua；换板子请同步改 board.lua 的 HW 表。
 
 --=============================================================================
 -- 日志

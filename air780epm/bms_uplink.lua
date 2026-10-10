@@ -1,58 +1,70 @@
 --[[
 @module  bms_uplink
-@summary 电池数据采集聚合 + MQTT 压缩上报（4G 通道）
-@version 1.0
-@date    2026.09.28
+@summary 4G MQTT 上报：从共享缓存取「真实样本」编码成 MessageV1，0 样本发空帧
+@version 2.0
+@date    2026.10.12
 @usage
-采集与上报流程（只做压缩上报、无 RPC）：
+数据流（与 README §1 一致）：
 
-  极空 BMS 广播一轮 (≈2.17s) ──► jk_display 解析 ──► "JK_ROUND" 事件
-        │  一轮 = 一条样本（采集时间粒度以极空广播间隔为准）
-        ▼
-  环形批次缓冲（cfg.BATCH_SAMPLES 条，默认 14 ≈ 30s）
-        │  攒满一批 → 复制到双缓冲快照 → "BMS_BATCH_READY"
-        ▼
-  bms_codec 列式 Delta+ZigZag+Varint 压缩编码（与 Go 服务端字节级兼容）
-        │
-        ▼
-  MQTT PUBLISH(QoS0) → <prefix>/<device_id>/status
+    极空一轮（JK_ROUND）──► bms_data 归一 ──► bms_cache ──since(游标)──► 本模块
+                                                                              │
+                                            bms_codec(MessageV1) ──► MQTT QoS0
+                                                <prefix>/<IMEI>/status
 
-上报与采集解耦：除"攒满一批立即上报"外，另有 REPORT_PERIOD_MS（默认 30s）
-  定时冲刷——无论极空是否采集到数据都上报：
-    · 周期内有真实样本 → 按实际条数上报（可不足 BATCH_SAMPLES）；
-    · 周期内完全没有极空数据 → 用兜底样本填满一批后上报
-      （REPORT_HOLD_LAST=true 沿用最近一次极空快照，false 则全 0）。
-
-上报主题：<MQTT_TOPIC_PREFIX>/<IMEI>/status。
-
-4G 上报开关：config.MQTT_HOST 留空（nil 或 ""）表示本机不用 4G 上报，
-  此时本模块不启动采样/组批/MQTT 任务，只打印一条提示，其余模块不受影响。
+关键约定（见 mqttagent/pkg/bms/bms.md）：
+  · 固定 REPORT_PERIOD_MS（默认 30s）一个周期：只上报「本轮窗口内新到达」的真实样本，
+    窗口为空则发 13 字节 0 样本帧（flags bit10），**绝不补零/插值/沿用旧值冒充采集数据**；
+  · 窗口游标是 bms_cache 的样本序号（不是时间戳），因此同一秒多条、NTP 跳变都不会
+    让窗口重叠或丢样；被环形缓冲覆盖而没来得及上报的样本计入 stats.lost；
+  · BaseTimestamp = 本批最新样本的 ts，Time = BaseTimestamp - ts（uint8 秒，窗口 ≤30s 远小于
+    255s；超出 255s 的样本本批跳过并计入 lost）；一批内串数以最新样本为准，串数不同的
+    样本本批跳过（重配串数时丢极少量样本）；
+  · 消息级字段：SOCFullChargeCap = 最新样本满电总容量，ModuleUPTime = 模组上电秒数，
+    BMSUPTime = 最新样本 BMS 上电秒数（modbus 的 0x12BC RunTime，display 恒 0），
+    JinjianModbusRequestCount / JikongModbusRequestCount = 两条从机/主站链路的请求计数；
+  · 鉴权：clientId = username = IMEI，password = HMAC-SHA256(key="soc", msg=IMEI) 小写 hex
+    （LuatOS 的 mqtt 签名是 auth(client_id, username, password[, clean_session])）；
+  · 未 NTP 对时前不发布（时间列与 BaseTimestamp 不可信）；MQTT 未就绪时丢弃并计数；
+  · config.MQTT_HOST 留空 = 整条 4G 链路关闭（只连 MQTT/上报，采集与金箭从机照常）。
 
 对外接口：
-  bms_uplink.is_enabled()  4G 上报是否启用（是否配置了 MQTT 地址）
-  bms_uplink.get_stats()  采集/上报统计
-  bms_uplink.flush()      立即把当前未满批次上报（调试用）
+  bms_uplink.is_enabled()     是否配置了 MQTT 地址
+  bms_uplink.get_stats()      上报统计
+  bms_uplink.topic()          上报主题（未连接时为 nil）
+  bms_uplink.is_mqtt_ready()  MQTT 是否已 CONNACK
+  bms_uplink.flush()          立即按当前游标上报一次（调试用）
+
+MQTT 总线（把这一条连接借给第二条传输，见 mgmt_mqtt.lua）：
+  bms_uplink.subscribe(topic, fn)        订阅主题，fn(topic, payload) 在 recv 事件里被调用
+  bms_uplink.publish(topic, payload, qos) 借这条连接发布（未就绪返回 false）
+  bms_uplink.client() / device_id()      取连接对象 / 设备 ID（IMEI）
+  本机 clientId = username = IMEI，同 broker 同 clientId 只允许一条连接，
+  所以第二条传输必须共用这条连接，不能自己 create/connect。
 ]]
 
 local cfg = require "config"
-local jk = require "jk"          -- 极空数据源（显示屏广播 / RS485 Modbus，按 config 选择）
+local cache = require "bms_cache"
 local codec = require "bms_codec"
+local hmac = require "hmac"
 local board = require "board"
+local data = require "bms_data" -- ModuleUPTime（mcu.ticks 单调计时）
 
 local M = {}
 
-local BATCH = cfg.BATCH_SAMPLES
+local REPORT_PERIOD_MS = tonumber(cfg.REPORT_PERIOD_MS) or 30000
+local MQTT_QOS = cfg.MQTT_QOS or 0
+local HMAC_SECRET = cfg.MQTT_HMAC_SECRET or "soc"
 
 --=============================================================================
 -- 4G 上报开关：config.MQTT_HOST 为空（nil / "" / 全空白）即视为未配置地址，
--- 此时整个上报链路（采样 → 组批 → 编码 → MQTT）都不启动。
+-- 此时不建 MQTT 连接、不上报；采集（bms_data）与金箭从机不受影响。
 --=============================================================================
 local function host_configured(host)
     return type(host) == "string" and host:match("%S") ~= nil
 end
 
 local MQTT_ENABLE = host_configured(cfg.MQTT_HOST)
-local MQTT_PORT   = tonumber(cfg.MQTT_PORT) or 1883
+local MQTT_PORT = tonumber(cfg.MQTT_PORT) or 1883
 
 local function d_info(...) if cfg.LOG_ENABLE then log.info("uplink", ...) end end
 local function d_warn(...) if cfg.LOG_ENABLE then log.warn("uplink", ...) end end
@@ -62,44 +74,6 @@ local function to_hex(s)
     return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end))
 end
 
---=============================================================================
--- 采样环形缓冲：扁平数组，避免热路径上产生大量小 table
---   cellVols[(sampleIndex-1)*cellCount + cellIndex]
---=============================================================================
-local ring = {
-    count = 0,
-    time = {}, temp1 = {}, temp2 = {}, tempMos = {}, balanCurrent = {},
-    batVol = {}, batCurrent = {}, socCycleCap = {}, socCapRemain = {},
-    cellVols = {},
-}
-
--- 双缓冲快照：采样 task 只写 ring，写满后整批复制到 hists[1|2]，
--- 上报 task 读另一个缓冲，互不干扰。
-local function new_hist()
-    return {
-        count = BATCH, cellCount = 0,
-        time = {}, temp1 = {}, temp2 = {}, tempMos = {}, balanCurrent = {},
-        batVol = {}, batCurrent = {}, socCycleCap = {}, socCapRemain = {},
-        cellVols = {},
-    }
-end
-local hists = { new_hist(), new_hist() }
-local hist_index = 0
-
-local batch_cell_count = 0 -- 当前批次固定的串数
-
-local stats = {
-    samples = 0,        -- 真实采集样本数（一轮极空广播 = 一条）
-    placeholders = 0,   -- 无采集数据时用兜底值填充的样本数
-    rounds_lost = 0,    -- 采集任务来不及消费而丢掉的极空轮数（sys.publish 只保留最后一次）
-    batches = 0,
-    published = 0,
-    dropped = 0,
-    encode_fail = 0,
-    last_payload_len = 0,
-    last_publish_ms = nil,
-}
-
 local function now_ms()
     if mcu and mcu.ticks and mcu.hz then
         return math.floor(mcu.ticks() * 1000 / mcu.hz())
@@ -108,19 +82,66 @@ local function now_ms()
 end
 
 --=============================================================================
--- MQTT 连接
+-- 统计（stat 日志与现场排查用）
+--=============================================================================
+local stats = {
+    samples = 0,       -- 已纳入上报窗口的真实样本数
+    empty_frames = 0,  -- 0 样本空帧数（窗口内没有新样本）
+    lost = 0,          -- 未上报而丢失的样本数（缓存覆盖 / 超出 255s / MQTT 未就绪丢弃）
+    batches = 0,       -- 生成并尝试上报的报文数（含空帧）
+    published = 0,
+    dropped = 0,       -- MQTT 未就绪被丢弃的报文数
+    encode_fail = 0,
+    last_payload_len = 0,
+    last_publish_ms = nil,
+    last_ts = 0,       -- 最近一次非空报文里的 BaseTimestamp（诊断）
+}
+
+--=============================================================================
+-- MQTT 连接（clientId = username = IMEI；password = HMAC-SHA256(key, IMEI)）
 --=============================================================================
 local mqttc = nil
 local device_id = nil
 local pub_topic = nil
 local mqtt_ready = false
+local last_reported_seq = 0  -- 上报游标：只上报该序号之后的样本，窗口不重叠
+local last_bms_uptime = 0    -- 最近已知的 BMS 上电秒数（空窗沿用，未知为 0）
+
+--=============================================================================
+-- MQTT 总线：把这一条连接借给第二条传输用（管理 MQTT JSON-RPC，见 mgmt_mqtt.lua）
+--   本机 clientId = username = device_id（IMEI），同一个 broker 上同一 clientId 只允许一条
+--   连接（另开一条会把上报这条踢下线），所以管理 MQTT 不自己建连，而是**共用这一条**：
+--     bms_uplink.subscribe(topic, fn)        订阅主题；fn(topic, payload) 在 recv 事件里同步调用
+--     bms_uplink.publish(topic, payload, qos) 借这条连接发布（MQTT 未就绪返回 false）
+--     bms_uplink.client() / device_id() / is_mqtt_ready()
+--   订阅在每个 CONNACK 后**重放**一遍：autoreconn 重连后订阅不会丢（见 connect_mqtt）。
+--   ⚠ 回调必须是同步、非阻塞的（在 MQTT 事件回调里执行），异常由 subscribe 侧自行 pcall 兜住。
+--=============================================================================
+local subs = {}                 -- { { topic = string, fn = function } }
+
+local function deliver(topic, payload)
+    for _, s in ipairs(subs) do
+        if s.topic == topic then
+            pcall(s.fn, topic, payload)
+        end
+    end
+end
+
+-- 逐个订阅已登记的主题（CONNACK 后调用；订阅动作本身失败只记日志，重连后还会再来一遍）
+local function replay_subs()
+    if mqttc == nil or not mqtt_ready or type(mqttc.subscribe) ~= "function" then
+        return
+    end
+    for _, s in ipairs(subs) do
+        pcall(mqttc.subscribe, mqttc, s.topic, cfg.MQTT_QOS or 0)
+    end
+end
 
 local function connect_mqtt()
     if not MQTT_ENABLE then
         return
     end
-    -- 等待 4G 拨号完成：限时等待 + 周期提示（sys.waitUntil 挂起协程，不占 CPU；
-    -- 加超时只是让现场日志能看出"卡在等网络"，不是阻塞其它任务）
+    -- 等待 4G 拨号完成：限时等待 + 周期提示（sys.waitUntil 挂起协程，不占 CPU）
     local ok, id
     repeat
         ok, id = sys.waitUntil("net_ready", 60000)
@@ -128,7 +149,8 @@ local function connect_mqtt()
             d_warn("waiting for net_ready ...")
         end
     until ok
-    device_id = id or "unknown"
+
+    device_id = tostring(id or (board and board.device_id and board.device_id()) or "unknown")
     pub_topic = cfg.MQTT_TOPIC_PREFIX .. "/" .. device_id .. "/status"
     d_info("topic", pub_topic)
 
@@ -142,18 +164,27 @@ local function connect_mqtt()
         d_error("mqtt.create failed")
         return
     end
-    mqttc:auth(device_id, cfg.MQTT_USER, cfg.MQTT_PASSWORD)
+
+    -- LuatOS mqtt:auth(client_id, username, password[, clean_session])
+    -- 本项目的约定：用户名 = clientId = IMEI，密码 = HMAC-SHA256("soc", IMEI) 小写 hex
+    local password = hmac.sha256_hex(HMAC_SECRET, device_id)
+    mqttc:auth(device_id, device_id, password)
     mqttc:autoreconn(true, cfg.MQTT_RECONN_MS)
     if mqttc.keepalive then
         mqttc:keepalive(cfg.MQTT_KEEPALIVE_S)
     end
 
-    mqttc:on(function(_, event, data)
+    -- LuatOS mqtt 事件回调：function(client, event, data, payload)
+    --   conack 后 data = nil；recv 时 data = 主题、payload = 载荷（管理 Modbus 走这条路进来）
+    mqttc:on(function(_, event, data, payload)
         if event == "conack" then
             mqtt_ready = true
-            d_info("mqtt connected", cfg.MQTT_HOST, MQTT_PORT)
+            d_info("mqtt connected", cfg.MQTT_HOST, MQTT_PORT, "client", device_id)
             if board then board.set_net_led("on") end
+            replay_subs()          -- 重连后订阅要重放（autoreconn 不会替我们记住）
             sys.publish("mqtt_conack")
+        elseif event == "recv" then
+            deliver(data, payload)
         elseif event == "disconnect" then
             mqtt_ready = false
             d_warn("mqtt disconnect, autoreconn in", cfg.MQTT_RECONN_MS, "ms")
@@ -164,226 +195,254 @@ local function connect_mqtt()
         end
     end)
 
+    -- 连接尝试与超时都打日志：现场"网络起来了但没有任何 mqtt 日志"时，能区分
+    -- 「卡在 connect/等 CONNACK」还是「根本没有发起连接」（见 README §9 位宽差异/现场排查）
+    d_info("mqtt connecting", cfg.MQTT_HOST, MQTT_PORT,
+        (cfg.MQTT_IS_SSL and "ssl" or "tcp"), "client", device_id)
     mqttc:connect()
-    -- 最多等 60s CONNACK（只用于日志/串灯提示）。未连上时批次按"未就绪丢弃"处理；
-    -- 重连由 mqtt 的 autoreconn 与事件回调负责，本任务到这里即可结束，不留空转协程。
-    sys.waitUntil("mqtt_conack", cfg.MQTT_CONNACK_TIMEOUT_MS)
-end
-
---=============================================================================
--- 采样：一轮广播 = 一条样本
---   上报与采集解耦：由 task_report 按 REPORT_PERIOD_MS 定时冲刷，
---   采集不到数据时用兜底样本补齐，保证"无论采集成功与否都按时上报"。
---=============================================================================
-local function snapshot_and_notify(n)
-    n = n or ring.count
-    if n < 1 then
-        return
-    end
-    hist_index = (hist_index % 2) + 1
-    local h = hists[hist_index]
-    local C = batch_cell_count
-    h.count = n
-    h.cellCount = C
-    for i = 1, n do
-        h.time[i] = ring.time[i]
-        h.temp1[i] = ring.temp1[i]
-        h.temp2[i] = ring.temp2[i]
-        h.tempMos[i] = ring.tempMos[i]
-        h.balanCurrent[i] = ring.balanCurrent[i]
-        h.batVol[i] = ring.batVol[i]
-        h.batCurrent[i] = ring.batCurrent[i]
-        h.socCycleCap[i] = ring.socCycleCap[i]
-        h.socCapRemain[i] = ring.socCapRemain[i]
-        local base = (i - 1) * C
-        for j = 1, C do
-            h.cellVols[base + j] = ring.cellVols[base + j]
-        end
-    end
-    ring.count = 0
-    stats.batches = stats.batches + 1
-    d_info("batch ready", stats.batches, "samples", n, "cells", C)
-    sys.publish("BMS_BATCH_READY", hist_index)
-end
-
--- is_fallback = true 表示本条没有新采集数据（兜底值），单独计数且不改批次串数
-local function add_sample(s, is_fallback)
-    local C
-    if is_fallback and batch_cell_count > 0 then
-        C = batch_cell_count   -- 兜底样本沿用当前批次串数，避免打断已有批次
-    else
-        C = cfg.CELL_COUNT > 0 and cfg.CELL_COUNT or s.cellCount
-    end
-    if C < 0 then
-        C = 0
-    end
-    if C > jk.MAX_CELLS then
-        C = jk.MAX_CELLS
-    end
-    if batch_cell_count == 0 then
-        batch_cell_count = C
-    elseif C ~= batch_cell_count then
-        -- 串数变化：丢弃未满批次重新开始，保证一批内串数固定
-        d_warn("cell count changed", batch_cell_count, "->", C, ", restart batch")
-        batch_cell_count = C
-        ring.count = 0
-    end
-
-    local pos = ring.count + 1
-    ring.time[pos] = s.ts
-    ring.temp1[pos] = s.tempBatC * 10      -- 0.1℃
-    -- 显示屏广播只有一路电池温度（temp1 = temp2）；Modbus 数据源有温度传感器 2
-    ring.temp2[pos] = (s.tempBat2C or s.tempBatC) * 10
-    ring.tempMos[pos] = s.tempMosC * 10
-    ring.balanCurrent[pos] = s.balanCurrentMa or 0 -- 广播里没有均衡电流，Modbus 有
-    ring.batVol[pos] = s.batVolMv
-    ring.batCurrent[pos] = s.batCurrentMa  -- 充电为正
-    ring.socCycleCap[pos] = s.fullCapMah   -- 估算总容量 mAh
-    ring.socCapRemain[pos] = s.capRemainMah
-    local base = (pos - 1) * batch_cell_count
-    for j = 1, batch_cell_count do
-        ring.cellVols[base + j] = s.cells[j] or 0
-    end
-    ring.count = pos
-    if is_fallback then
-        stats.placeholders = stats.placeholders + 1
-    else
-        stats.samples = stats.samples + 1
-    end
-
-    if ring.count >= BATCH then
-        snapshot_and_notify(BATCH)
-    end
-end
-
--- 兜底样本：默认沿用最近一次极空快照（保持数值连续），从未收到过则全 0；
--- 时间戳用当前时间，保证上报时间轴连续。
-local function fallback_sample(ts)
-    local s = jk.get_state()
-    if cfg.REPORT_HOLD_LAST ~= false and s and s.cellCount and s.cellCount > 0 then
-        return {
-            ts = ts,
-            cellCount = s.cellCount,
-            cells = s.cells,
-            batVolMv = s.batVolMv,
-            batCurrentMa = s.batCurrentMa,
-            soc = s.soc,
-            tempBatC = s.tempBatC,
-            tempBat2C = s.tempBat2C,
-            tempMosC = s.tempMosC,
-            balanCurrentMa = s.balanCurrentMa,
-            fullCapMah = s.fullCapMah or 0,
-            capRemainMah = s.capRemainMah or 0,
-        }
-    end
-    return {
-        ts = ts,
-        cellCount = 0,
-        cells = {},
-        batVolMv = 0,
-        batCurrentMa = 0,
-        soc = 0,
-        tempBatC = 0,
-        tempMosC = 0,
-        fullCapMah = 0,
-        capRemainMah = 0,
-    }
-end
-
--- 采样任务：首样本前等待 NTP 对时（最多 60s），保证 Time 列准确。
--- 说明（LuatOS 单线程协作式调度）：
---   · sys.waitUntil 只是挂起本协程，事件不来时本任务休眠、不占 CPU，不影响其它任务；
---   · sys.publish 只保留"最后一次"事件值：若本任务未及时消费，中间的轮次会被覆盖丢失。
---     本任务每条样本只做几次表复制（微秒级），正常不会丢；这里统计丢轮数便于现场判断。
-local function task_sample()
-    sys.waitUntil("ntp_synced", 60000)
-    local consumed = jk.get_stats().rounds or 0 -- 以开始消费时的轮数为基准，避免统计开机前的轮次
-    while true do
-        local ok, s = sys.waitUntil("JK_ROUND")
-        if ok and s then
-            local total = jk.get_stats().rounds or 0
-            if total - consumed > 1 then
-                stats.rounds_lost = stats.rounds_lost + (total - consumed - 1)
-            end
-            consumed = total
-            add_sample(s)
-        end
-    end
-end
-
--- 上报任务：与采集解耦，无论是否采集到数据，每个 REPORT_PERIOD_MS 都冲刷/上报一次
---   ring 里有真实样本 → 按实际条数上报（可不足 BATCH_SAMPLES）；
---   ring 为空（整个周期没有极空数据）→ 用兜底样本填满一批后上报。
-local function task_report()
-    local period_ms = cfg.REPORT_PERIOD_MS or 30000
-    local step_s = math.max(1, math.floor(period_ms / BATCH / 1000))
-    while true do
-        sys.wait(period_ms)
-        if ring.count > 0 then
-            snapshot_and_notify(ring.count)
-        else
-            d_warn("no collection data, report fallback batch")
-            local now = os.time()
-            for i = 1, BATCH do
-                add_sample(fallback_sample(now - (BATCH - i) * step_s), true)
-            end
-        end
+    -- 最多等 60s CONNACK（只用于日志/串灯提示）。重连由 autoreconn 与事件回调负责。
+    if not sys.waitUntil("mqtt_conack", cfg.MQTT_CONNACK_TIMEOUT_MS) then
+        d_warn("mqtt conack timeout", cfg.MQTT_CONNACK_TIMEOUT_MS,
+            "ms, autoreconn 仍在按", cfg.MQTT_RECONN_MS, "ms 重连")
     end
 end
 
 --=============================================================================
--- 上报：编码 + MQTT 发布
+-- 上报窗口 → MessageV1
 --=============================================================================
--- 编码分片让出：codec 是纯 CPU 计算（无 IO），长批次/多电芯时同步跑会长时间占住
--- 调度器（实测 14×20≈0.55ms、30×32≈1.3ms 于 PC Lua，模组上还要慢数倍），
+-- 编码分片让出：codec 是纯 CPU 计算（无 IO），多电芯/多样本时同步跑会长时间占住调度器，
 -- 这里每编码若干列主动让出一次（cfg.ENCODE_YIELD_MS = 0/nil 时不让出）。
 local function encode_yield()
     local ms = cfg.ENCODE_YIELD_MS
     if ms and ms > 0 then
-        -- 让出只在协程（任务）里可行：flush() 等调试入口若在非任务上下文被调用，
-        -- sys.wait 会报错，这里吞掉异常，退化成同步编码（不影响结果）
+        -- flush() 等调试入口若在非任务上下文被调用，sys.wait 会报错，这里吞掉异常，
+        -- 退化成同步编码（不影响结果）
         pcall(sys.wait, ms)
     end
 end
 
-local function task_publish()
-    while true do
-        local ok, idx = sys.waitUntil("BMS_BATCH_READY")
-        if ok and idx and hists[idx] then
-            local payload = codec.encode(hists[idx], encode_yield)
-            if payload then
-                stats.last_payload_len = #payload
-                d_info("batch encoded", #payload, "bytes")
-                if cfg.LOG_HEX_PAYLOAD then
-                    log.info("uplink.hex", to_hex(payload))
-                end
-                if mqttc and mqtt_ready and mqttc:ready() then
-                    mqttc:publish(pub_topic, payload, cfg.MQTT_QOS)
-                    stats.published = stats.published + 1
-                    stats.last_publish_ms = now_ms()
-                    d_info("published", pub_topic, #payload, "bytes qos", cfg.MQTT_QOS)
-                else
-                    stats.dropped = stats.dropped + 1
-                    d_warn("mqtt not ready, drop batch")
-                end
-            else
-                stats.encode_fail = stats.encode_fail + 1
-                d_error("encode failed")
+-- 惰性取对端计数，避免与 jinjian_slave / jk_modbus 的加载顺序耦合；
+-- display 模式不加载 jk_modbus（否则会去抢占极空那条 RS485-3 做 115200 轮询）。
+local function module_stat(module_name, field)
+    local ok, mod = pcall(require, module_name)
+    if not ok or type(mod) ~= "table" or type(mod.get_stats) ~= "function" then
+        return 0
+    end
+    local st = mod.get_stats()
+    local v = type(st) == "table" and tonumber(st[field]) or nil
+    return v or 0
+end
+
+local function clamp_u16(v)
+    v = math.floor(tonumber(v) or 0)
+    if v < 0 then return 0 end
+    if v > 0xFFFF then return 0xFFFF end
+    return v
+end
+
+-- u32 列的上限。不能写成 `v > 0xFFFFFFFF`：Air780EPM 固件的 Lua 是 32 位整数
+-- （LUA_32BITS），该字面量会回绕成 -1，比较恒为真 → 每个样本的总压/容量都被钳成
+-- -1，无符号列按 0 写出（实测 32 位 Lua 下 selftest 报「总压列 mV got 0/剩余容量
+-- 列 mAh got 0」）。32 位固件的整数上限是 2^31-1，远高于真实电压 mV / 容量 mAh。
+local U32_MAX = 0x7FFFFFFF
+
+local function clamp_u32(v)
+    v = math.floor(tonumber(v) or 0)
+    if v < 0 then return 0 end
+    if v > U32_MAX then return U32_MAX end
+    return v
+end
+
+local function clamp_i16(v)
+    v = math.floor(tonumber(v) or 0)
+    if v < -0x8000 then return -0x8000 end
+    if v > 0x7FFF then return 0x7FFF end
+    return v
+end
+
+local function clamp_i32(v)
+    v = math.floor(tonumber(v) or 0)
+    if v < -0x80000000 then return -0x80000000 end
+    if v > 0x7FFFFFFF then return 0x7FFFFFFF end
+    return v
+end
+
+-- 把窗口内样本装进编码器要的扁平结构；返回 hist, meta, n, latest_seq
+-- 只做「真实样本」的搬运与钳位，不补零、不插值。
+local function build_batch()
+    local samples, latest_seq, lost = cache.since(last_reported_seq)
+    if lost > 0 then
+        stats.lost = stats.lost + lost
+    end
+    if latest_seq < last_reported_seq then
+        latest_seq = last_reported_seq
+    end
+
+    local newest = cache.latest()
+    local cellCount = (newest and newest.cellCount) or 0
+    local count = #samples
+
+    -- BaseTimestamp = 本批时序数据里**最新**的采集时间（与 pkg/bms 的定义一致：
+    -- "本批时序数据中最新的记录时间"）。正常 ts 单调，就是最后一条样本的 ts；
+    -- NTP 微调导致时钟回跳时取窗口内最大值，避免个别样本算出负偏移被丢掉。
+    local base_ts = 0
+    local full_cap = 0
+    if count > 0 then
+        for i = 1, count do
+            local ts = samples[i].ts or 0
+            if ts > base_ts then
+                base_ts = ts
             end
         end
+        -- SOCFullChargeCap 取最新一条样本（按采集顺序）的满电容量
+        full_cap = samples[count].socFullChargeCapMah or 0
+    elseif newest then
+        base_ts = newest.ts or 0
+        full_cap = newest.socFullChargeCapMah or 0
     end
+    if newest and (newest.bmsUpTimeS or 0) > 0 then
+        last_bms_uptime = newest.bmsUpTimeS
+    end
+
+    local hist, n = nil, 0
+    if count > 0 then
+        hist = {
+            count = 0, cellCount = cellCount,
+            temp1 = {}, temp2 = {}, tempMos = {}, balanCurrent = {},
+            batVol = {}, batCurrent = {}, socCycleCap = {}, socCapRemain = {},
+            time = {}, cellVols = {},
+        }
+        for i = 1, count do
+            local s = samples[i]
+            if (s.cellCount or 0) == cellCount then
+                local off = base_ts - (s.ts or 0)
+                if off >= 0 and off <= 255 then
+                    n = n + 1
+                    hist.temp1[n] = clamp_i16((s.tempBat1C or 0) * 10)   -- int16, 0.1℃
+                    hist.temp2[n] = clamp_i16((s.tempBat2C or 0) * 10)
+                    hist.tempMos[n] = clamp_i16((s.tempMosC or 0) * 10)
+                    hist.balanCurrent[n] = clamp_u16(s.balanCurrentMa or 0) -- uint16, mA
+                    hist.batVol[n] = clamp_u32(s.batVolMv or 0)             -- uint32, mV
+                    hist.batCurrent[n] = clamp_i32(s.batCurrentMa or 0)     -- int32, mA
+                    hist.socCycleCap[n] = clamp_u32(s.socCycleCapMah or 0)  -- uint32, mAh
+                    hist.socCapRemain[n] = clamp_u32(s.socCapRemainMah or 0)
+                    hist.time[n] = off                                     -- uint8, 距 BaseTimestamp 秒
+                    local base = (n - 1) * cellCount
+                    for j = 1, cellCount do
+                        hist.cellVols[base + j] = clamp_u16(s.cells and s.cells[j] or 0)
+                    end
+                else
+                    -- 超过 uint8 时间窗（正常 30s 窗口不会发生）：只跳过该条，不伪造时间
+                    stats.lost = stats.lost + 1
+                end
+            else
+                -- 串数与本批基准不同：本批跳过（下一批按新串数上报）
+                stats.lost = stats.lost + 1
+            end
+        end
+        hist.count = n
+        if n == 0 then
+            hist = nil
+        end
+    end
+
+    local meta = {
+        socFullChargeCap = full_cap,
+        baseTimestamp = base_ts,
+        moduleUpTime = data.module_uptime_s(),
+        bmsUpTime = last_bms_uptime,
+        jinjianModbusRequestCount = module_stat("jinjian_slave", "queries"),
+        jikongModbusRequestCount = (cfg.JK_PROTOCOL == "modbus")
+            and module_stat("jk_modbus", "requests") or 0,
+    }
+    return hist, meta, n, latest_seq
+end
+
+-- 上报一次：窗口非空 → encode；窗口为空 → 13 字节 0 样本帧
+local function report_once()
+    local hist, meta, n, latest_seq = build_batch()
+
+    local payload
+    if n > 0 and hist then
+        local ok_enc, res = pcall(codec.encode, hist, meta, encode_yield)
+        if ok_enc then
+            payload = res
+        else
+            d_error("encode error", res)
+        end
+    else
+        payload = codec.encode_empty(meta)
+    end
+
+    if not payload then
+        stats.encode_fail = stats.encode_fail + 1
+        d_error("encode failed")
+        return false, "encode failed"
+    end
+
+    -- 本窗口的真实样本只上报这一次：游标先推进，保证窗口永不重叠
+    last_reported_seq = latest_seq
+    stats.batches = stats.batches + 1
+    stats.last_payload_len = #payload
+    if n > 0 then
+        stats.samples = stats.samples + n
+        stats.last_ts = meta.baseTimestamp or 0
+    else
+        stats.empty_frames = stats.empty_frames + 1
+    end
+
+    if cfg.LOG_HEX_PAYLOAD then
+        log.info("uplink.hex", to_hex(payload))
+    end
+
+    if mqttc and mqtt_ready and mqttc:ready() then
+        mqttc:publish(pub_topic, payload, MQTT_QOS)
+        stats.published = stats.published + 1
+        stats.last_publish_ms = now_ms()
+        d_info("published", pub_topic, #payload, "bytes qos", MQTT_QOS, "samples", n)
+        return true, #payload
+    end
+
+    stats.dropped = stats.dropped + 1
+    if n > 0 then
+        stats.lost = stats.lost + n
+    end
+    d_warn("mqtt not ready, drop report", #payload, "bytes, samples", n)
+    return false, "mqtt not ready"
 end
 
 --=============================================================================
 -- 启动
 --=============================================================================
+local ntp_ready = false
+
+-- 时间是否已可信：优先看 ntp_synced 事件，其次看 os.time() 是否已是合理 Unix 时间
+-- （NTP 成功后系统 RTC 会被更新；事件错过时靠这条兜底，最多等 60s 起步）
+local function time_looks_synced()
+    local t = os.time()
+    return t ~= nil and t > 1600000000
+end
+
+-- 上报任务：等 NTP 对时 → 每 REPORT_PERIOD_MS 上报一次当前窗口
+local function task_report()
+    while not ntp_ready do
+        if time_looks_synced() then
+            ntp_ready = true
+        elseif sys.waitUntil("ntp_synced", 60000) then
+            ntp_ready = true
+        end
+    end
+    while true do
+        sys.wait(REPORT_PERIOD_MS)
+        report_once()
+    end
+end
+
 if MQTT_ENABLE then
-    sys.taskInit(task_sample)
-    sys.taskInit(task_report)
-    sys.taskInit(task_publish)
     sys.taskInit(connect_mqtt)
+    sys.taskInit(task_report)
 else
-    log.info("uplink", "MQTT_HOST 未配置, 关闭 4G 上报（不采样/不组批/不连 MQTT）")
+    log.info("uplink", "MQTT_HOST 未配置, 关闭 4G 上报（采集与金箭从机不受影响）")
 end
 
 --=============================================================================
@@ -405,45 +464,50 @@ function M.is_mqtt_ready()
     return mqtt_ready
 end
 
--- 立即上报当前未满批次（不足 BATCH 条时按实际条数编码，调试用）
+--=============================================================================
+-- MQTT 总线对外接口（管理 MQTT JSON-RPC 共用这条连接，见 mgmt_mqtt.lua）
+--=============================================================================
+-- 订阅一个主题：fn(topic, payload) 在 recv 事件里被同步调用。
+-- 连接已就绪时立即订阅，否则记下主题、CONNACK 后由 replay_subs() 重放（断线重连也不丢）。
+function M.subscribe(topic, fn)
+    if type(topic) ~= "string" or topic == "" or type(fn) ~= "function" then
+        return false
+    end
+    subs[#subs + 1] = { topic = topic, fn = fn }
+    if mqttc and mqtt_ready and type(mqttc.subscribe) == "function" then
+        pcall(mqttc.subscribe, mqttc, topic, cfg.MQTT_QOS or 0)
+    end
+    return true
+end
+
+-- 借这条连接发布（MQTT 未就绪返回 false，调用方自己计数/重试）
+function M.publish(topic, payload, qos)
+    if mqttc == nil or not mqtt_ready then
+        return false
+    end
+    if type(mqttc.ready) == "function" and not mqttc:ready() then
+        return false
+    end
+    return mqttc:publish(topic, payload, qos or MQTT_QOS)
+end
+
+function M.client()
+    return mqttc
+end
+
+function M.device_id()
+    return device_id
+end
+
+-- 立即按当前游标上报一次（调试用）
 function M.flush()
     if not MQTT_ENABLE then
         return false, "mqtt disabled"
     end
-    if ring.count == 0 then
-        return false, "no sample"
+    if not ntp_ready and not time_looks_synced() then
+        return false, "time not synced"
     end
-    local h = new_hist()
-    local n = ring.count
-    local C = batch_cell_count
-    h.count = n
-    h.cellCount = C
-    for i = 1, n do
-        h.time[i] = ring.time[i]
-        h.temp1[i] = ring.temp1[i]
-        h.temp2[i] = ring.temp2[i]
-        h.tempMos[i] = ring.tempMos[i]
-        h.balanCurrent[i] = ring.balanCurrent[i]
-        h.batVol[i] = ring.batVol[i]
-        h.batCurrent[i] = ring.batCurrent[i]
-        h.socCycleCap[i] = ring.socCycleCap[i]
-        h.socCapRemain[i] = ring.socCapRemain[i]
-        local base = (i - 1) * C
-        for j = 1, C do
-            h.cellVols[base + j] = ring.cellVols[base + j]
-        end
-    end
-    local payload = codec.encode(h, encode_yield)
-    if not payload then
-        return false, "encode failed"
-    end
-    if mqttc and mqtt_ready and mqttc:ready() then
-        mqttc:publish(pub_topic, payload, cfg.MQTT_QOS)
-        stats.published = stats.published + 1
-        stats.last_payload_len = #payload
-        return true, #payload
-    end
-    return false, "mqtt not ready"
+    return report_once()
 end
 
 return M
