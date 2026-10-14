@@ -1,6 +1,6 @@
 --[[
 @module  jk_display
-@summary 极空(JK) BMS 显示屏协议接收与解析（RS4851 / 串口1）
+@summary 极空(JK) BMS 显示屏协议接收与解析（RS485-3 / UART3）
 @version 1.1
 @date    2026.09.30
 @usage
@@ -18,7 +18,7 @@
   轮字节数随固件/串数变化（20 串 = 364 字节，≥25 串多 9 字节），本模块一律按
   LEN 定界、不写死轮长。
 
-  单体颜色帧（旧文档误称"记录块/均衡线电阻表"）：
+  单体颜色帧：
     0x07E0 绿 = 普通单体，0x001F 蓝 = 最高单体，0xF800 红 = 最低单体，0x0000 黑 = 未用槽位
 
 对外接口：
@@ -27,6 +27,8 @@
   jk_display.get_stats()   统计信息（轮数、帧数、错误数、最近错误）
                            rounds = 收到极空保护板的数据次数（完整广播轮数，一轮一份数据）
                            frames = 已解析帧数
+                           rx_bytes = 串口收到的原始字节数（0 = 一个字节都没进来：接线/极性/
+                                      保护板未开显示屏协议；有字节但 rounds 恒 0 = 波特率/协议不匹配）
   jk_display.MAX_CELLS     协议里单体的最大槽位数（主块 24 + 0x2011 补发的第 25 节）
 
 每解析完一轮广播（扩展块结束）发布一次 "JK_ROUND" 事件，携带本轮 state，
@@ -34,6 +36,7 @@
 ]]
 
 local cfg = require "config"
+local uart_pins = require "uart_pins"
 local M = {}
 
 -- 主数据块 24 槽 + 0x2011 补发的第 25 节（≥25 串才发）
@@ -50,6 +53,7 @@ local function d_debug(...) if cfg.LOG_RAW_FRAMES then log.info("jk.raw", ...) e
 local stats = {
     frames = 0,          -- 已解析帧数
     rounds = 0,          -- 已完成轮数（= 收到极空保护板的数据次数，一轮一份数据）
+    rx_bytes = 0,        -- 串口收到的原始字节数（0 = 一路数据都没进来，先查接线/波特率）
     sync_lost = 0,       -- 因帧头/长度非法丢弃的字节数（重新同步）
     bad_len = 0,         -- 长度与命令码不匹配的帧数
     cell_mismatch = 0,   -- Σ单体电压 与 总电压 明显不符的次数
@@ -157,7 +161,7 @@ local function handle_main(data)
     work.main = m
 end
 
--- 扩展块（20×u16，字段依据 2026-09-29 固件逆向版手册 §3.3 / §11.4）
+-- 扩展块（20×u16，字段依据固件逆向版手册 §3.3 / §11.4）
 local function handle_ext(data)
     work.ext = {
         socIcon        = u16(data, 0),   -- SOC 电池图标格数（5 格图标）
@@ -343,7 +347,8 @@ local function finalize_round()
 
     work = new_work()
     -- 一轮一条样本：注意 sys.publish 只保留最后一次事件值，
-    -- 消费端（bms_uplink 采样任务）必须能及时消费，否则会丢轮（见其 stats.rounds_lost）。
+    -- 消费端（bms_data 采集任务）必须能及时消费，否则会丢轮；它每条只做一次字段
+    -- 映射就 push 进 bms_cache，正常不会丢。
     sys.publish("JK_ROUND", s)
 end
 
@@ -453,6 +458,7 @@ local function on_receive(id)
         s = uart.read(id, 256)
         if s and #s > 0 then
             buf = buf .. s
+            stats.rx_bytes = stats.rx_bytes + #s
         end
     until not s or #s == 0
     -- 防止异常情况下缓冲区无限增长
@@ -470,6 +476,9 @@ local function open_uart()
     if not uart or not uart.setup then
         return false
     end
+    -- UART3 不是默认复用功能：先把 RX/TX 脚（本板 PIN53/PIN52）设成 UART3 功能再开串口，
+    -- 否则串口能打开、日志照写，总线上却一个字节都没有（见 uart_pins.lua / README §7.1）。
+    uart_pins.mux(cfg.JK_UART_ID, cfg.JK_PIN_RX, cfg.JK_PIN_TX, "jk")
     local dir = cfg.JK_RS485_DIR_GPIO or 0xFFFFFFFF
     local ok = uart.setup(cfg.JK_UART_ID, cfg.JK_BAUD, 8, 1, uart.NONE,
         uart.LSB, cfg.JK_RX_BUFF_SIZE, dir, cfg.JK_RS485_RX_LEVEL, cfg.JK_RS485_DELAY_US)
