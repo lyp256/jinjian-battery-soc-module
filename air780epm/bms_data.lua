@@ -90,7 +90,7 @@ function M.normalize(s)
     elseif cellCount > MAX_CELLS then
         cellCount = MAX_CELLS
     end
-    -- config.CELL_COUNT > 0 时固定串数（覆盖自动识别），与旧实现的后门保持一致
+    -- config.CELL_COUNT > 0 时固定串数（覆盖自动识别）
     -- （固定值大于实际串数时缺失槽位为 0；大于 MAX_CELLS 时按 MAX_CELLS 截断）
     local fixed = math.floor(num(cfg.CELL_COUNT, 0))
     if fixed > 0 then

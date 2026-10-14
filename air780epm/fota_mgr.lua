@@ -4,8 +4,8 @@
 @version 1.0
 @date    2026.10.14
 @usage
-本模块管理两种互斥的升级通道（原模块名 `fota.lua`，**改名**是因为 LuatOS 核心库里也有一个
-全局 `fota`（本地升级/差分写入），同名会让 require 与核心库互相遮蔽）：
+本模块管理两种互斥的升级通道（命名 `fota_mgr` 而非 `fota`：LuatOS 核心库里有一个全局
+`fota`（本地升级/差分写入），同名会让 require 与核心库互相遮蔽）：
 
   ① URL 通道：主站下发 fota.url（URL）→ 封装官方扩展库
      `libfota2.request(cb, { url = <主站给的 URL>, progress = <可选进度回调> })`
@@ -13,7 +13,7 @@
   ② 本地通道：主站用 fota.begin + fota.chunk（MQTT）/ BLOB 帧（UART）把 LuatOS `.bin`
      升级载荷**分段流式**写进设备：核心库 `fota.init()` → 反复 `fota.run(buf)` →
      `fota.isDone()` → `fota.finish(ok)` 直接写 Flash，**不联网、不落文件**；收齐且
-     （可选）CRC32 校验通过后同样只置「成功待重启」，由主站下发现有重启命令 0x0001。
+     （可选）CRC32 校验通过后同样只置「成功待重启」，由主站下发 cmd.reboot 重启（见 README §7.2）。
      · 用法照官方 demo（`demo/fota/fota(使用fota核心库)/fota_uart.lua`、
        `demo/fota/fota(使用fota核心库)/fota_file.lua`、`demo/fota/ble_5101_fota/`）：
        `fota.init()` 后**轮询 `fota.wait()` 等底层就绪**（`while not fota.wait() do sys.wait(100) end`）。
@@ -26,8 +26,8 @@
      · ⚠ 核心库 `fota` 在 Lua 里**不是 table**：LuatOS 的 C 库都通过 `rotable2_newlib()` 注册成
        「userdata + 元表」的**只读表**（Lua 侧 `type(fota) == "userdata"`，`__name == "rotable"`），
        方法从元表 `__index` 取，`fota.init()` 这种点号调用照常可用。因此**判「库在不在」只能看
-       `fota.init` 是否可调用**；早期写法 `type(fota) == "table"` 会把「有库」误判成「缺库」，
-       现象是 `caps.core=false` + `fota.begin` 回 `ENOLIB`（本机实测踩过一次）。
+       `fota.init` 是否可调用**；用 `type(fota) == "table"` 判会把「有库」误判成「缺库」，
+       现象是 `caps.core=false` + `fota.begin` 回 `ENOLIB`。
 
 统一状态（fota.status / mgmt.status.get 的 fota 字段）：
     0 idle / 1 进行中 / 2 成功待重启 / 3 失败

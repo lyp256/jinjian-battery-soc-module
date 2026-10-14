@@ -5,7 +5,8 @@
 @date    2026.09.28
 @usage
 本文件集中存放所有可调参数，其它模块通过 require "config" 读取。
-修改参数后重新烧录脚本即可生效（本工程没有 RPC/Web 配置通道）。
+修改参数后重新烧录脚本即可生效；运行期也可由管理链路 config.set 覆盖（写透 fskv，
+见 README §7）。
 
 硬件资源（银尔达 D700Tm / Air780EPM）：
   RS4851 = 串口1（UART1，默认复用），方向控制 EN = GPIO25 → 管理链路（裸帧 RPC）
@@ -14,7 +15,7 @@
   NET LED = GPIO27（输出，高电平亮）
   Reload 按键 = GPIO30（输入上拉，按下接 GND）
   硬件看门狗 = GPIO28 → Air153C/Air153D 的 WTDOG（air153C_wtd：开机喂一次 +
-               每 30s 一个 400ms 正脉冲；实测 exair153x_wdt 喂不动本板，见 README §8）
+               每 30s 一个 400ms 正脉冲；不要改用官方扩展库 exair153x_wdt，见 README §8）
   可控电压输出 = GPIO21，输出使能 = GPIO22
   供电电压采集 = ADC0（0-90V，电压 = ADC 电压 * 273300 / 3300）
 ]]
@@ -83,7 +84,9 @@ M.JJ_PARSE_MAX_FRAMES          = 8     -- 解析任务单次最多处理多少�
 -- 金箭协议里"本模块无对应数据源"的寄存器取值（本地缓存，可被主站写入覆盖）
 M.JJ_DEFAULT_CHARGE_TIME_MIN   = 120 -- reg1089 充电时间，极空 RCVTime 默认 2.0H
 M.JJ_DEFAULT_CHARGE_TARGET_SOC = 90  -- reg1090 目标 SOC（%）
-M.JJ_FAST_CHARGE_CURRENT_MA    = 0   -- 快充判定电流阈值（0 = 只要在充电即认为快充）
+-- 快充判定倍率（C）：判定电流 mA = 倍率 × 电池容量(Ah)（容量 54Ah 时 1C = 54A）
+--   1 = 1C；支持小数（0.5 = 半倍率）；0 = 只要在充电即认为快充
+M.JJ_FAST_CHARGE_C_RATE        = 1   -- 快充判定倍率（C，1 = 1C = 容量 Ah 对应的电流）
 M.JJ_BATTERY_TYPE              = 0   -- reg103 电池类型，0 = 锂电
 
 -- 低温保护推导阈值（极空显示屏协议没有专用的低温报警位）
@@ -206,7 +209,7 @@ M.CELL_COUNT                   = 0
 --=============================================================================
 --   引脚/外设固定（NET LED GPIO27、Reload 按键 GPIO30、看门狗 GPIO28 → Air153C/Air153D
 --   的 WTDOG、可控电压输出 GPIO21+GPIO22、供电电压 ADC0、引脚复用表 pins_Air780EPM.json），
---   全部硬编码在 board.lua 顶部的 HW 表里，这里不再提供开关（引脚复用表路径也写死在
+--   全部硬编码在 board.lua 顶部的 HW 表里，这里不提供开关（引脚复用表路径也写死在
 --   board.lua：/luadb/pins_Air780EPM.json）。
 --   要调板级参数（喂狗周期 WTD_FEED_MS、长按时长 RELOAD_REBOOT_MS、采样次数 ADC_SAMPLES
 --   等）改 board.lua；换板子请同步改 board.lua 的 HW 表。

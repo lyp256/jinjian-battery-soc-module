@@ -15,7 +15,8 @@
 4. bms_data.normalize：display 与 modbus 快照的字段对照（温度/均衡电流/循环容量/
    满电容量/上电时间/source）与 module_uptime_s；
 5. jk_display：整轮 364 字节广播逐字段核对（含 25 串第 25 节帧、蜂鸣器帧、分片接收）；
-6. jinjian_slave：缓存驱动 0-8/9-32/103-113/开关量/快充应答、写入与异常码、
+6. jinjian_slave：缓存驱动 0-8/9-32/103-113/开关量/快充应答（快充按充电倍率 C × 容量 Ah
+   判定，含 0/0.05C/0.1C、容量变化与容量未知）、写入与异常码、
    缓存为空时全 0 应答（不崩、不应答超时）；
 7. 端到端：协程调度器真跑「JK_ROUND → bms_data → bms_cache → bms_uplink → MQTT」，
    用独立实现的 MessageV1 解码器逐字段核对（含消息级字段、鉴权参数、主题）；
@@ -31,9 +32,9 @@
     错误码（EBADJSON/EBADMETHOD/EBADPARAM/EBADKEY/EBADVALUE/EBUSY/ENOLIB/EFOTA/EBADSEQ/
     EFLASH）、config.set 白名单与原子性、ID 去重（重复请求只执行一次）、命令回帧先于动作、
     FOTA 编排（BLOB 与 base64 两条路径）、hello / fota 事件触发；
-12. cfg_store：白名单/类型/范围校验、非法项跳过、写透往返（打桩 fskv）、
+12. cfg_store：白名单/类型/范围校验（含 float 快充倍率）、非法项跳过、写透往返（打桩 fskv）、
     覆盖在模块加载前生效、恢复出厂、fskv 缺失降级；
-13. fota_mgr（原 fota，改名避免与核心库全局 fota 同名）：URL 通道在 libfota2 打桩下的
+13. fota_mgr：URL 通道在 libfota2 打桩下的
     状态机（idle→下载中→成功待重启/失败）、进度/结果码、未联网不启动、忙时拒绝、空
     URL、库缺失；本地通道在核心库 fota 打桩下的状态机（idle→preparing→ready→receiving
     →verifying→success）、init/wait/run 失败、isDone 超时、CRC32 不匹配、主动中止、
@@ -426,8 +427,8 @@ check("sha256 两个分组 = FIPS 已知答案",
 
 -- 填充边界（FIPS 180-4 §5.1.1）：55~57 跨 0x80/k 边界、63~65 跨 64B 分组边界、
 -- 119/120/128 多分组。这些长度会走到 pad() 里 64 位比特长度的高/低半字写入
--- （原实现用 0x100000000 求高 32 位，在 32 位整数固件里该字面量回绕成 0 →
--- sha256.lua:50: attempt to divide by zero）。参考值取自 Python hashlib。
+-- （用 0x100000000 求高 32 位在 32 位整数固件里会回绕成 0 → 除以 0）。
+-- 参考值取自 Python hashlib。
 for _, case in ipairs({
     { 55,  "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318" },
     { 56,  "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a" },
@@ -689,7 +690,7 @@ check("分片接收后串数", s2 and s2.cellCount, 20)
 check("分片接收后总压", s2 and s2.batVolMv, 66070)
 
 -- 5.1 0x80 = 写寄存器：寄存器 0x02 的蜂鸣器帧不能当作轮起点
---     （旧实现按"任何 0x80 都是轮起点"处理，会把一轮在轮尾截断）
+--     （任何 0x80 都当轮起点会把一轮在轮尾截断）
 local jk3 = dofile(here .. "/../jk_display.lua")
 jk3.feed(round)
 check("基准轮串数", jk3.get_state().cellCount, 20)
@@ -899,6 +900,45 @@ do
     check("忽略非本机地址帧计数", st.ignored, 1)
     check("收帧数 = 查询 + 忽略", st.rx_frames, st.queries + st.ignored)
     check("最近查询时间已记录", st.last_query_ms ~= nil, true)
+end
+
+-- 6.14 快充判定：按「充电倍率（C）× 电池容量 Ah」，不再是固定电流值
+do
+    local cfg_jj = require "config"
+    local rate_saved = cfg_jj.JJ_FAST_CHARGE_C_RATE
+    local function fast_state()
+        local resp = jj.handle_frame(from_hex("01 01 00 3F 00 01 CD C6"))
+        return string.byte(resp, 4)
+    end
+
+    -- 6.1 入缓存的 display 样本：容量 53922mAh（≈53.9Ah）、充电电流 3400mA
+    check("快充：样本容量 = 剩余容量÷SOC", cached and cached.socFullChargeCapMah, 53922)
+    check("快充：样本充电电流 mA", cached and cached.batCurrentMa, 3400)
+
+    -- 先喂一条放电样本：清掉 6.11 的"结束快充"锁定，并核对放电时恒为非快充
+    bms_cache.push({ ts = 1700000300, batCurrentMa = -3400, socFullChargeCapMah = 53922 })
+    check("放电中（电流 < 0）：非快充", fast_state(), 0)
+
+    bms_cache.push(cached)                                   -- 还原成真实充电样本
+    cfg_jj.JJ_FAST_CHARGE_C_RATE = 0                         -- 0 = 只要在充电即认为快充
+    check("倍率 0：充电中即快充", fast_state(), 1)
+
+    cfg_jj.JJ_FAST_CHARGE_C_RATE = 0.05                      -- 0.05C ≈ 2696mA ≤ 3400mA
+    check("倍率 0.05C（阈值 2696mA < 3400mA）：快充", fast_state(), 1)
+
+    cfg_jj.JJ_FAST_CHARGE_C_RATE = 0.1                       -- 0.1C ≈ 5392mA > 3400mA
+    check("倍率 0.1C（阈值 5392mA > 3400mA）：非快充", fast_state(), 0)
+
+    -- 同一倍率、同一电流，容量变小 → 阈值变小 → 判定翻转（阈值跟着容量走）
+    bms_cache.push({ ts = 1700000302, batCurrentMa = 3400, socFullChargeCapMah = 20000 })
+    check("倍率 0.1C + 20Ah 容量（阈值 2000mA）：快充", fast_state(), 1)
+
+    -- 容量未知（0）→ 阈值退化为 0，等价"只要在充电即认为快充"
+    bms_cache.push({ ts = 1700000303, batCurrentMa = 3400, socFullChargeCapMah = 0 })
+    check("容量未知（0）：退化为只要在充电即快充", fast_state(), 1)
+
+    bms_cache.push(cached)                                   -- 还原缓存里的真实样本
+    cfg_jj.JJ_FAST_CHARGE_C_RATE = rate_saved
 end
 
 --=============================================================================
@@ -1820,7 +1860,7 @@ _G.fskv = mg_fskv
 local mg_saved = {}
 for _, k in ipairs({ "MGMT_BAUD", "LOG_ENABLE", "REPORT_PERIOD_MS", "STATUS_REPORT_MS",
         "JK_PROTOCOL", "JK_MODBUS_SLAVE_ADDR", "JK_MODBUS_POLL_MS", "JJ_LOW_TEMP_CHARGE_C",
-        "JJ_LOW_TEMP_DISCHARGE_C", "JJ_FAST_CHARGE_CURRENT_MA", "MQTT_PORT", "MQTT_IS_SSL",
+        "JJ_LOW_TEMP_DISCHARGE_C", "JJ_FAST_CHARGE_C_RATE", "MQTT_PORT", "MQTT_IS_SSL",
         "MQTT_QOS", "MQTT_KEEPALIVE_S", "MQTT_HOST", "MQTT_TOPIC_PREFIX" }) do
     mg_saved[k] = cfg_mg[k]
 end
@@ -1962,6 +2002,16 @@ do
     check("config.set：写入 config", cfg_mg.JK_MODBUS_POLL_MS, 1500)
     check("config.set：落盘（store.get）", store_m.get("LOG_ENABLE"), false)
     check("config.set：实时键不置需重启", r.result.restart_required, false)
+
+    -- 快充倍率（float）：小数写透、越界/负值拒绝
+    local rf = rpc("config.set", { JJ_FAST_CHARGE_C_RATE = 0.5 })
+    check("config.set：浮点倍率写入成功", rf.ok and rf.result.applied.JJ_FAST_CHARGE_C_RATE == 0.5, true)
+    check("config.set：浮点倍率写入 config", cfg_mg.JJ_FAST_CHARGE_C_RATE, 0.5)
+    check("config.set：浮点倍率落盘（store.get）", store_m.get("JJ_FAST_CHARGE_C_RATE"), 0.5)
+    check("config.set：浮点倍率超范围 → EBADVALUE",
+        rpc("config.set", { JJ_FAST_CHARGE_C_RATE = 11 }).error.code, "EBADVALUE")
+    check("config.set：浮点倍率负值 → EBADVALUE",
+        rpc("config.set", { JJ_FAST_CHARGE_C_RATE = -0.5 }).error.code, "EBADVALUE")
 
     check("config.set：非法键 → EBADKEY", rpc("config.set", { NOT_A_KEY = 1 }).error.code, "EBADKEY")
     check("config.set：越界值 → EBADVALUE",
@@ -2156,6 +2206,14 @@ do
     check("范围非法被拒绝（端口 70000）", store_a.set("MQTT_PORT", 70000), false)
     check("枚举非法被拒绝（JK_PROTOCOL）", store_a.set("JK_PROTOCOL", "xx"), false)
     check("类型非法被拒绝（MQTT_HOST 给数字）", store_a.set("MQTT_HOST", 123), false)
+    -- 快充倍率是白名单里唯一的浮点键：小数合法、越界/非数字拒绝、字符串小数也接受
+    local ok_rate, rate_val = store_a.check("JJ_FAST_CHARGE_C_RATE", 0.5)
+    check("浮点倍率：0.5C 合法且保留小数", ok_rate and rate_val == 0.5, true)
+    local ok_rate_s, rate_val_s = store_a.check("JJ_FAST_CHARGE_C_RATE", "0.25")
+    check("浮点倍率：字符串 0.25 也接受", ok_rate_s and rate_val_s == 0.25, true)
+    check("浮点倍率：负值被拒绝", store_a.check("JJ_FAST_CHARGE_C_RATE", -0.5), false)
+    check("浮点倍率：超范围被拒绝（11C）", store_a.check("JJ_FAST_CHARGE_C_RATE", 11), false)
+    check("浮点倍率：非数字被拒绝", store_a.check("JJ_FAST_CHARGE_C_RATE", "x"), false)
     check("超长字符串被拒绝（65 字符）", store_a.set("MQTT_HOST", string.rep("a", 65)), false)
     check("布尔 0/1 归一化（LOG_ENABLE=1 → true）",
         (store_a.set("LOG_ENABLE", 1) and cfg_mg.LOG_ENABLE), true)
@@ -2164,8 +2222,8 @@ do
     check("写透：立即改 config", cfg_mg.MGMT_BAUD, 9600)
     check("写透：立即落盘（fskv 里是 JSON 文本）", type(kv12[store_a.key()]), "string")
     check("[R] 键置需重启", store_a.needs_restart(), true)
-    check("从站地址概念已删除（MODBUS_SLAVE_ADDR 不在白名单）",
-        store_a.set("MODBUS_SLAVE_ADDR", 240), false)
+    check("不在白名单的键被拒绝（BOGUS_KEY）",
+        store_a.set("BOGUS_KEY", 240), false)
 
     -- 重启等价：新实例 load 后覆盖项在业务模块加载前生效
     cfg_mg.MGMT_BAUD, cfg_mg.LOG_ENABLE = 115200, false  -- 模拟未加载覆盖时的默认值
@@ -2175,18 +2233,17 @@ do
     check("覆盖生效：LOG_ENABLE 回到 true", cfg_mg.LOG_ENABLE, true)
     check("覆盖项如实记录", store_b.get("MGMT_BAUD"), 9600)
 
-    -- 非法/未知项跳过（旧 MODBUS_* 覆盖项也按「不在白名单」跳过）
+    -- 非法/未知项跳过（不在白名单的键按「不在白名单」跳过）
     kv12[store_a.key()] = _G.json.encode{
-        MGMT_BAUD = 115200, MQTT_PORT = 99999, BOGUS_KEY = 1, MODBUS_SLAVE_ADDR = 240,
+        MGMT_BAUD = 115200, MQTT_PORT = 99999, BOGUS_KEY = 1,
         JK_PROTOCOL = "modbus" }
     cfg_mg.MGMT_BAUD, cfg_mg.MQTT_PORT, cfg_mg.JK_PROTOCOL = 9600, 1883, "display"
     local store_c = dofile(here .. "/../cfg_store.lua")
-    check("只应用合法项（越界/未知/旧 MODBUS_* 跳过）", store_c.load(), 2)
+    check("只应用合法项（越界/未知跳过）", store_c.load(), 2)
     check("合法项 1 生效", cfg_mg.MGMT_BAUD, 115200)
     check("合法项 2 生效", cfg_mg.JK_PROTOCOL, "modbus")
     check("越界项未生效（端口保持默认）", cfg_mg.MQTT_PORT, 1883)
     check("未知项不进覆盖", store_c.get("BOGUS_KEY"), nil)
-    check("旧 MODBUS_SLAVE_ADDR 覆盖项被跳过", store_c.get("MODBUS_SLAVE_ADDR"), nil)
 
     check("恢复出厂", store_c.reset(), true)
     check("恢复出厂清空覆盖", store_c.has_override(), false)
@@ -2353,7 +2410,7 @@ end
 -- 13.2b 核心库 fota 的「暴露形态」：LuatOS 的 C 库都是 rotable（userdata + 元表，
 --       元表 __name="rotable"，见 lua/src/rotable2.c 的 rotable2_newlib），**不是 Lua table**。
 --       探测若写成 `type(fota) == "table"`，真机上就会「有库却报缺库」：
---       现场现象 = status.get 的 caps.core=false + fota.begin 回 ENOLIB（本用例就是它的回归）。
+--       caps.core=false + fota.begin 回 ENOLIB（本用例就是它的回归）。
 do
     local fm = dofile(here .. "/../fota_mgr.lua")
 
@@ -2448,7 +2505,7 @@ do
     check("init 抛异常失败码 -10", fm2.info().result, -10)
 end
 
--- 13.5 legacy fota.wait 的存在与返回值都不影响流程
+-- 13.5 fota.wait 返回 false 也不影响流程
 do
     local core = make_core_fota(10)
     core.wait = function() core.calls[#core.calls + 1] = "wait"; return false end

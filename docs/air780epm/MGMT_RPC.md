@@ -147,15 +147,15 @@ fota{mode, state, stage, result, progress, rx, total, last_seq,
 | `LOG_ENABLE` | true/false | 实时 |
 | `JK_MODBUS_POLL_MS` | 100–60000 | 实时 |
 | `JJ_LOW_TEMP_CHARGE_C` / `JJ_LOW_TEMP_DISCHARGE_C` | -100…100（℃） | 实时 |
-| `JJ_FAST_CHARGE_CURRENT_MA` | 0–65535（mA） | 实时 |
+| `JJ_FAST_CHARGE_C_RATE` | 0–10（C，充电倍率，可为小数；判定电流 = 倍率 × 容量 Ah，`1` = 1C，`0` = 只要在充电） | 实时 |
 | `REPORT_PERIOD_MS` / `STATUS_REPORT_MS` | 1000–3600000 | `[R]` |
 | `JK_PROTOCOL` | `display` / `modbus` | `[R]` |
 | `JK_MODBUS_SLAVE_ADDR` | 1–247 | `[R]` |
 | `MQTT_PORT` `MQTT_IS_SSL` `MQTT_QOS` `MQTT_KEEPALIVE_S` `MQTT_HOST` `MQTT_TOPIC_PREFIX` | 见 `config.lua` | `[R]` |
 
-> **旧的 `MODBUS_*` 覆盖项作废**：开机 `load()` 时按"不在白名单"跳过并打日志（无需迁移代码）。
-> 从站地址概念已删除（`MODBUS_SLAVE_ADDR` / `MODBUS_CMD_ARM_TIMEOUT_MS` 不再存在）。
+> 开机 `load()` 时不在白名单的覆盖项会被跳过并打日志。
 > `cmd.factory_reset` 清掉 fskv 覆盖并置待生效位，**重启后**回 `config.lua` 默认值。
+> 快充倍率是小数（`float` 类型），按 JSON number 传（`0.5`），字符串 `"0.5"` 也接受。
 
 ## 8. 事件（仅 UART）
 
@@ -233,11 +233,11 @@ MQTT 传输**不发事件**。`mgmt_probe.ps1 -Action listen` 可监听这两类
 > **底层固件必须带核心库 `fota`（`LUAT_USE_FOTA`）**。判据：`caps.core`（或 `fota.begin` 直接返回
 > `ENOLIB`）。缺失时一个字节都不写、设备仍跑旧版本（优雅降级 + 安全失败）。
 >
-> ⚠ **判「有没有库」不能看 `type(fota) == "table"`**：LuatOS 的 C 库由 `rotable2_newlib()`
+> ⚠ **判「有没有库」只能看「`fota.init` 是否可调用」**：LuatOS 的 C 库由 `rotable2_newlib()`
 > （`lua/src/rotable2.c`）注册成 **userdata + 元表**的只读表 —— `type(fota) == "userdata"`、
-> 元表 `__name == "rotable"`，成员从元表 `__index` 解析，`fota.init()` 点号调用照常可用。
-> 旧探针按 table 判，真机上就是"有库却报缺库"（`caps.core=false` + `ENOLIB`）；现在以
-> 「`fota.init` 可调用」为准，并加 `caps.core_type` 便于现场区分。回归用例：自测 §13.2b。
+> 元表 `__name == "rotable"`，成员从元表 `__index` 解析，`fota.init()` 点号调用照常可用；
+> 用 `type(fota) == "table"` 判会误报「缺库」（`caps.core=false` + `ENOLIB`）。
+> `caps.core_type` 是它的类型名字符串，便于现场区分。回归用例：自测 §13.2b。
 
 ## 11. 管理 MQTT JSON-RPC（通道 = 主题后缀 `rpc`）
 
@@ -258,7 +258,7 @@ mosquitto_pub -h 399.run -t '/device/861234567890123/rpc' -m '{"id":1,"method":"
 mosquitto_pub -h 399.run -t '/device/861234567890123/rpc' -m '{"id":2,"method":"status.get"}'
 ```
 
-> broker 若开 ACL，需放行 `.../rpc`（订阅）与 `.../rpc/resp`（发布）。旧 `.../modbus` 主题失效。
+> broker 若开 ACL，需放行 `.../rpc`（订阅）与 `.../rpc/resp`（发布）。
 
 ## 12. PC 侧验收：`tools/mgmt_probe.ps1`
 

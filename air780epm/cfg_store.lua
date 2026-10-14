@@ -50,6 +50,7 @@ local function d_warn(...) if cfg.LOG_ENABLE ~= false then log.warn("cfg", ...) 
 
 --=============================================================================
 -- 白名单：键 → 类型 / 范围（不在表里的键一律拒绝）
+--   类型：bool / int（取整） / float（保留小数，如快充倍率 0.5C） / enum / string
 --=============================================================================
 local BAUD_ENUM = { 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200 }
 
@@ -61,7 +62,8 @@ M.SPEC = {
     JK_MODBUS_POLL_MS          = { type = "int", min = 100, max = 60000 },
     JJ_LOW_TEMP_CHARGE_C       = { type = "int", min = -100, max = 100 },
     JJ_LOW_TEMP_DISCHARGE_C    = { type = "int", min = -100, max = 100 },
-    JJ_FAST_CHARGE_CURRENT_MA  = { type = "int", min = 0, max = 65535 },
+    -- 快充判定倍率（C）：判定电流 mA = 倍率 × 电池容量(Ah)，1 = 1C；小数（0.5C）用 float
+    JJ_FAST_CHARGE_C_RATE      = { type = "float", min = 0, max = 10 },
     -- [R] 重启后生效
     REPORT_PERIOD_MS           = { type = "int", min = 1000, max = 3600000 },
     STATUS_REPORT_MS           = { type = "int", min = 1000, max = 3600000 },
@@ -137,6 +139,15 @@ local function validate(spec, value)
             return false
         end
         n = math.floor(n)
+        if (spec.min ~= nil and n < spec.min) or (spec.max ~= nil and n > spec.max) then
+            return false
+        end
+        return true, n
+    elseif spec.type == "float" then
+        local n = tonumber(value)
+        if n == nil then
+            return false
+        end
         if (spec.min ~= nil and n < spec.min) or (spec.max ~= nil and n > spec.max) then
             return false
         end

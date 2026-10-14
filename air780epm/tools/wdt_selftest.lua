@@ -7,16 +7,16 @@
 在 air780epm 目录下执行：
     lua tools/wdt_selftest.lua
 
-背景：D700Tm 的板级资源固定，board.lua 已改成硬编码（不再读 config 开关，也不再多后端
-探测）。本自测用打桩的 sys/gpio/log/pm/pins/adc/air153C_wtd 真跑 board.lua，覆盖：
-1. 硬件看门狗（现场唯一有效写法，见 README §8）：air153C_wtd.init(28) 先建确定的初始电平
+背景：D700Tm 的板级资源固定，board.lua 里全部硬编码。本自测用打桩的
+sys/gpio/log/pm/pins/adc/air153C_wtd 真跑 board.lua，覆盖：
+1. 硬件看门狗（README §8）：air153C_wtd.init(28) 先建确定的初始电平
    → 加载期立刻喂一次 → 独立 sys 任务每 30s 喂一次，每次都是 400ms 正脉冲（拉高，
-   400ms 后拉低）；GPIO28 上只有 board.lua 一个写入者，且不再加载官方默认扩展库
-   exair153x_wdt（它在本板上打"喂狗完成"但芯片照旧复位）；
+  400ms 后拉低）；GPIO28 上只有 board.lua 一个写入者，且不加载官方扩展库
+  exair153x_wdt（它在本板上打"喂狗完成"但芯片照旧复位）；
 2. 喂狗库 air153C_wtd 没随脚本打包 → board.lua 在**加载期**就报错退出（不是"跑起来但
    静默不喂狗"），错误信息里能直接看出是哪个模块取不到；
 3. 引脚复用：开机按固定路径 pins.loadjson("/luadb/pins_Air780EPM.json")，表没下载进去 /
-   老固件没有 pins 库时只告警不崩，且都不影响喂狗；
+   固件没有 pins 库时只告警不崩，且都不影响喂狗；
 4. 开机把 GPIO 高电平设成 3.3V（D700Tm 外围电路要求；1.8V 喂不动 Air153C），
    老固件没有 pm.ioVol 时只告警；
 5. 供电电压采集 ADC0：mV = ADC mV × 273300 / 3300。
@@ -170,8 +170,8 @@ end
 -- 工程自带的看门狗库 air153C_wtd 的打桩（接口与 air153C_wtd.lua 一致）：
 --   init(pin)       gpio.setup(pin, 0, gpio.PULLDOWN) + gpio.set(pin, 0)（建确定的初始电平）
 --   feed_dog(pin)   gpio.set(pin, 1)，400ms 后 gpio.set(pin, 0) → 400ms 正脉冲
--- 现场结论：本板只有这种波形喂得动 Air153C（官方默认扩展库 exair153x_wdt 喂不动，
--- 每 30s 打"喂狗完成"但芯片照旧按自身超时复位，见 README §8）。
+-- 本板只有这种波形喂得动 Air153C（官方扩展库 exair153x_wdt 喂不动，每 30s 打
+-- "喂狗完成"但芯片照旧按自身超时复位，见 README §8）。
 --=============================================================================
 local function make_air153c(opts)
     opts = opts or {}
@@ -308,7 +308,7 @@ local function scenario(opts)
         package.preload["air153C_wdt"] = nil
         package.preload["air153C_wtd"] = function() return air153c end
     end
-    -- 钉住"不再加载官方默认扩展库 exair153x_wdt"：真被 require 到就能发现
+    -- 守卫"board.lua 不加载官方扩展库 exair153x_wdt"：真被 require 到就能发现
     _G.__exair_required = false
     package.preload["exair153x_wdt"] = function()
         _G.__exair_required = true
@@ -341,10 +341,10 @@ local function scenario(opts)
 end
 
 --=============================================================================
--- 1. 现场场景：工程自带的 air153C_wtd 喂狗（唯一有效写法）
+-- 1. 工程自带的 air153C_wtd 喂狗（board.lua 默认路径）
 --=============================================================================
 do
-    local w = scenario({ name = "1. 现场：air153C_wtd 喂狗（唯一有效写法）" })
+    local w = scenario({ name = "1. air153C_wtd 喂狗" })
     check("1 board.lua 加载成功", w.ok, true)
     check("1 init 到 GPIO28", w.air153c.init_pin, 28)
     local s28 = last_pin_setup(28)

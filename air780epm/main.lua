@@ -14,7 +14,7 @@
    读状态、读写配置（写透持久化到 fskv）、命令（重启 / FOTA / 恢复出厂），见 README §7。
 
 模块划分：
-  config.lua          集中配置（串口/GPIO/波特率/MQTT/批次/管理 Modbus 等）
+  config.lua          集中配置（串口/GPIO/波特率/MQTT/批次/管理链路等）
   cfg_store.lua       运行期配置持久化（fskv）：开机覆盖 config 表，写透 + 恢复出厂
   board.lua           D700Tm 板级资源（LED/按键/看门狗/可控电源/供电电压/设备 ID）
   jk.lua              极空数据源入口：按 config.JK_PROTOCOL 转发到下面两个实现之一
@@ -174,9 +174,8 @@ sys.taskInit(function()
     end
 
     -- 先等 4G 链路真的就绪（mobile 库在 PDP 激活后 publish "IP_READY"）。
-    -- 只用 socket.adapter(socket.dft()) 判据不够：实测开机 0.42s 它就非 nil，而 IP_READY
-    -- 到 7.87s 才来 —— NTP 会抢在没网时发查询（三个服务器连续超时、白等 ~6s，首个上报
-    -- 被推迟），MQTT 也会在链路起来前就 connect。
+    -- 只用 socket.adapter(socket.dft()) 判据不够：它在 PDP 激活前就可能非 nil，
+    -- 会让 NTP/MQTT 抢在没网时发查询/连接。以 IP_READY 为准。
     if not sys.waitUntil("IP_READY", NET_READY_GRACE_MS) then
         log.warn("main", "wait IP_READY", NET_READY_GRACE_MS, "ms timeout, fallback to adapter check")
         while not net_ready() do

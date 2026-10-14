@@ -28,7 +28,8 @@
     1016/1017 版本   脚本 VERSION 解析为 a高.a低 / b高.b低
     1089  充电时间   本地缓存（默认 120 分钟），可被主站写入
     1090  目标SOC    本地缓存（默认 90%），可被主站写入
-  开关量(01)：4 短路 / 5 过温充电 / 6 过温放电 / 7 低温充电 / 8 低温放电 / 63 快充状态
+  开关量(01)：4 短路 / 5 过温充电 / 6 过温放电 / 7 低温充电 / 8 低温放电 /
+              63 快充状态（充电中且充电电流 ≥ 快充倍率 × 电池容量 Ah，见 JJ_FAST_CHARGE_C_RATE）
   写入：06 写 0x0441(充电时间) / 0x0442(目标SOC)；05 写 0x0040 FF00(结束快充)
 
 对外接口：
@@ -232,7 +233,20 @@ local function protection_bits()
     return bits
 end
 
--- 是否处于快充（充电中且电流达到阈值，且主站没有下过"结束快充"）
+-- 快充判定电流阈值（mA）：充电倍率（C）× 电池容量（Ah）
+--   倍率 1 = 1C，即充电电流达到「容量 Ah 的数值」（54Ah → 54A = 54000mA）；
+--   容量取规范样本的满电总容量 socFullChargeCapMah（mAh），所以 1C 阈值 mA = 容量 mAh 数值；
+--   倍率 0（默认）或容量未知（0）→ 阈值 0，退化为"只要在充电即认为快充"。
+local function fast_charge_threshold_ma(s)
+    local rate = tonumber(cfg.JJ_FAST_CHARGE_C_RATE) or 0
+    local cap_mah = tonumber(s and s.socFullChargeCapMah) or 0
+    if rate <= 0 or cap_mah <= 0 then
+        return 0
+    end
+    return rate * cap_mah
+end
+
+-- 是否处于快充（充电中且电流达到倍率阈值，且主站没有下过"结束快充"）
 local function fast_charging()
     local s = sample()
     if not s then
@@ -245,7 +259,7 @@ local function fast_charging()
     if cache.fastChargeEnded then
         return 0
     end
-    return (s.batCurrentMa >= cfg.JJ_FAST_CHARGE_CURRENT_MA) and 1 or 0
+    return (s.batCurrentMa >= fast_charge_threshold_ma(s)) and 1 or 0
 end
 
 -- 读单个寄存器；返回 nil 表示地址非法（异常码 02）

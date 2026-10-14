@@ -224,7 +224,7 @@ function M.new(opts)
         return {
             core = (type(fi) == "table" and fi.core) and true or false,
             -- 核心库 fota 的 Lua 类型：nil（没有）/ userdata（LuatOS rotable，正常）/ table
-            -- —— 现场用它一眼分清「固件真没库」和「探测写错了」（见 fota_mgr.lua get_core）
+            -- —— 现场用它一眼分清固件到底有没有这个库（见 fota_mgr.lua get_core）
             core_type = (type(fi) == "table" and fi.core_type) or nil,
             lib  = (type(fi) == "table" and fi.lib) and true or false,
             local_enabled = (cfg.MGMT_FOTA_LOCAL_ENABLE ~= false),
@@ -525,7 +525,7 @@ function M.new(opts)
     end
 
     -- 数据块写入公共路径：UART BLOB 与 MQTT fota.chunk（base64）都走这里。
-    -- 偏移由设备「按已收字节自动推得」（不再由主站传 offset）。
+    -- 偏移由设备「按已收字节自动推得」（主站不传 offset）。
     local function do_fota_chunk(seq, data)
         seq = tonumber(seq)
         if not seq or seq < 1 then

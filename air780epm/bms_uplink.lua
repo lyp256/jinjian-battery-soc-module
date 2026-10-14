@@ -175,7 +175,7 @@ local function connect_mqtt()
     end
 
     -- LuatOS mqtt 事件回调：function(client, event, data, payload)
-    --   conack 后 data = nil；recv 时 data = 主题、payload = 载荷（管理 Modbus 走这条路进来）
+    --   conack 后 data = nil；recv 时 data = 主题、payload = 载荷（管理 MQTT JSON-RPC 走这条路进来）
     mqttc:on(function(_, event, data, payload)
         if event == "conack" then
             mqtt_ready = true
@@ -196,7 +196,7 @@ local function connect_mqtt()
     end)
 
     -- 连接尝试与超时都打日志：现场"网络起来了但没有任何 mqtt 日志"时，能区分
-    -- 「卡在 connect/等 CONNACK」还是「根本没有发起连接」（见 README §9 位宽差异/现场排查）
+    -- 「卡在 connect/等 CONNACK」还是「根本没有发起连接」
     d_info("mqtt connecting", cfg.MQTT_HOST, MQTT_PORT,
         (cfg.MQTT_IS_SSL and "ssl" or "tcp"), "client", device_id)
     mqttc:connect()
@@ -242,8 +242,7 @@ end
 
 -- u32 列的上限。不能写成 `v > 0xFFFFFFFF`：Air780EPM 固件的 Lua 是 32 位整数
 -- （LUA_32BITS），该字面量会回绕成 -1，比较恒为真 → 每个样本的总压/容量都被钳成
--- -1，无符号列按 0 写出（实测 32 位 Lua 下 selftest 报「总压列 mV got 0/剩余容量
--- 列 mAh got 0」）。32 位固件的整数上限是 2^31-1，远高于真实电压 mV / 容量 mAh。
+-- -1，无符号列写出 0。32 位固件的整数上限是 2^31-1，远高于真实电压 mV / 容量 mAh。
 local U32_MAX = 0x7FFFFFFF
 
 local function clamp_u32(v)

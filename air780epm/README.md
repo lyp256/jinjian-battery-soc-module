@@ -62,7 +62,7 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 | `config.lua` | 全部可调参数（串口/GPIO/波特率/MQTT/批次/阈值/日志开关） |
 | `board.lua` | 板级资源：引脚复用（开机加载 `pins_Air780EPM.json`）、可控电压输出、NET LED、Reload 按键、硬件看门狗、供电电压、设备 ID/PN |
 | `pins_Air780EPM.json` | LuatIO 管脚表（银尔达 D700Tm）：PIN52/53 = UART3_TXD/RXD、PIN106 = GPIO25（RS485-1 方向）、PIN78 = GPIO28（看门狗）、PIN16 = GPIO27（NET LED）…；随脚本打包进 `/luadb/`，固件开机自动加载（见 §2.2） |
-| `air153C_wtd.lua` | 看门狗库（官方老库，**`board.lua` 实际用它喂狗**）：GPIO28 每 30s 一个 400ms 正脉冲，开机先喂一次。实测本板只有这种写法能喂动 Air153C，官方默认扩展库 `exair153x_wdt` 打"喂狗完成"但芯片照旧按自身超时复位（见 §8） |
+| `air153C_wtd.lua` | 喂狗库（`board.lua` 实际使用）：GPIO28 每 30s 一个 400ms 正脉冲，开机先喂一次。**不要换用官方扩展库 `exair153x_wdt`**（本板喂不动，见 §8） |
 | `jk.lua` | 极空数据源入口：按 `config.JK_PROTOCOL` 转发到下面两个实现之一（接口完全一致） |
 | `jk_display.lua` | 极空显示屏协议接收解析（帧定界、三类数据块、自检、数据失效标记） |
 | `jk_modbus.lua` | 极空 RS485 Modbus 主站（03H 读寄存器、CRC、轮询调度、单位换算、失效标记） |
@@ -78,12 +78,12 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 | `uart_pins.lua` | UART 引脚复用兜底：把配置的 RX/TX 脚设成 `UART<n>` 功能（极空链路的 UART3/PIN53/PIN52 需要；UART1/UART2 默认复用不用配） |
 | `mgmt_mqtt.lua` | 管理 MQTT JSON-RPC 传输：与 UART1 并列的第二条管理通道，**通道 = 主题后缀**（默认 `rpc`：下行 `<prefix>/<device>/rpc`、上行 `.../rpc/resp`），与 4G 上报**共用同一条 MQTT 连接**（clientId=IMEI 只允许一条）；`MGMT_MQTT_ENABLE` 默认 true，`MQTT_HOST` 未配置时自动不启动（见 §7.7） |
 | `cfg_store.lua` | 配置持久化：开机把 fskv 里的覆盖项按白名单写回 `config`（早于业务模块加载）、写透落盘、恢复出厂清覆盖；fskv 不可用时降级为不持久化 |
-| `fota_mgr.lua` | FOTA 升级管理（**原名 `fota.lua`**，改名是为了避开 LuatOS 核心库里的全局 `fota`；同名会互相遮蔽）：① URL 通道封装 `libfota2.request`（联网下载）；② 本地通道用核心库 `fota.init/run/isDone/finish` 把主站经管理链路分段上传的升级包**流式写进 Flash**（不联网、不落文件、不依赖 `libfota2`）。两条通道互斥，成功都只置「成功待重启」+ 状态 2，由主站下发现重启命令（见 §7.4 / §7.5） |
+| `fota_mgr.lua` | FOTA 升级管理（命名 `fota_mgr` 以避开 LuatOS 核心库的全局 `fota`，同名会互相遮蔽）：① URL 通道封装 `libfota2.request`（联网下载）；② 本地通道用核心库 `fota.init/run/isDone/finish` 把主站经管理链路分段上传的升级包**流式写进 Flash**（不联网、不落文件、不依赖 `libfota2`）。两条通道互斥，成功都只置「成功待重启」+ 状态 2，由主站下发现重启命令（见 §7.4 / §7.5） |
 | `tools/mgmt_probe.ps1` | PC 侧管理链路探针（裸帧 RPC 主站）：自动组帧/算 CRC16、`ping`/`status`/`config`/`set`/`reboot`/`factory`/`url` FOTA/`localfota`（BLOB 分块）/`abort`/`raw`/`echo`/`listen`（见 §7.6） |
 | `tools/selftest.lua` | 离线自测（PC 端 Lua 5.4）：MessageV1 黄金向量、SHA/HMAC、缓存、适配层、广播解析、Modbus 主站、从机应答、端到端上报，以及管理帧编解码/方法分发/配置持久化/FOTA/两条传输/整链路 smoke |
 | `../hwsim.lua` | 仓库根目录的虚拟时钟仿真：真跑 `jk_display → bms_data → bms_cache → bms_uplink`，观察「30s 窗口真实样本」与「掉线后 0 样本空帧」，并可 `DUMP=` 导出 payload 给服务端解码器核对 |
 
-> `config.lua` 不入库（`air780epm/.gitignore` 已忽略）；仓库中的 `config.lua.tpl` 是脱敏模板。
+> `config.lua` 不入库（仓库 `.gitignore` 已忽略）；仓库中的 `config.lua.tpl` 是脱敏模板。
 > 首次使用（或模板更新后）请复制为 `config.lua`（Windows: `copy config.lua.tpl config.lua`）再填本地信息，
 > 真实 MQTT 服务器/账号/密码只写在 `config.lua`，禁止提交到仓库。
 
@@ -100,7 +100,7 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 | RS485-3 | 串口3 | 极空 BMS 数据源（`JK_PROTOCOL` 二选一）：广播只收 2400 8N1（`JK_UART_ID=3`、`JK_BAUD=2400`）或 Modbus 主站 115200 8N1（`JK_MODBUS_BAUD=115200`、`JK_MODBUS_SLAVE_ADDR=1`）。**本板 RS485-3 接的是 UART3 的 B 组：PIN53=UART3_RXD、PIN52=UART3_TXD**（收发器自动方向，无 EN）。UART3 不是默认复用功能，模块开机自动 `uart_pins` 复用；引脚组与排查见 §7.8 |
 | NET LED | GPIO27 | 状态指示（输出，高电平亮）：注册网络快闪 → 拨号成功慢闪 → MQTT 连上常亮 |
 | Reload 按键 | GPIO30 | 输入上拉，按下接 GND；长按 3s 重启模组 |
-| 硬件看门狗 | GPIO28 | 外置 Air153C/Air153D 的 WTDOG。**GPIO 高电平必须是 3.3V**（`pm.ioVol(pm.IOVOL_ALL_GPIO, 3300)`，D700Tm 资源表要求；26.04 NOCAM 固件默认只有 1.8V，1.8V 喂不动芯片）。喂狗用工程自带的 `air153C_wtd`：开机 `init(28)` 并立刻喂一次，之后独立任务每 30s 一个 400ms 正脉冲（`board.lua` 是 GPIO28 的唯一写入者；改回 `exair153x_wdt` 会随机重启，见 §8）；复位原因用管理链路读（`status.get` 的 `reset_reason`，见 §7.3），`board.lua` 不再开机打印 |
+| 硬件看门狗 | GPIO28 | 外置 Air153C/Air153D 的 WTDOG。**GPIO 高电平必须是 3.3V**（`pm.ioVol(pm.IOVOL_ALL_GPIO, 3300)`，D700Tm 资源表要求；26.04 NOCAM 固件默认只有 1.8V，1.8V 喂不动芯片）。喂狗用工程自带的 `air153C_wtd`：开机 `init(28)` 并立刻喂一次，之后独立任务每 30s 一个 400ms 正脉冲（`board.lua` 是 GPIO28 的唯一写入者；**不要换用 `exair153x_wdt`**，见 §8）。复位原因用管理链路读（`status.get` 的 `reset_reason`，见 §7.3） |
 | 可控电压输出 | GPIO21 | 输出供电电压（最大 1A），开机默认打开 |
 | 输出使能脚 | GPIO22 | 输出时序：使能高 → 设置输出 → 延时 5ms → 使能低；模组重启后输出状态保持 |
 | 供电电压采集 | ADC0 | 0–90V，`电压 = ADC 电压 × 273300/3300`，每 60s 打印 |
@@ -161,7 +161,7 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 
 | `JK_PROTOCOL` | 协议 | 物理/参数 | 特点 |
 |---|---|---|---|
-| `"display"`（默认） | 显示屏接口广播（原实现，解析要点见下一节） | 2400 8N1、单向广播、只收不发 | 无需轮询；但字段有缺失（无均衡电流/循环次数/实际容量），总容量靠 `剩余容量 ÷ SOC` 估算 |
+| `"display"`（默认） | 显示屏接口广播（解析要点见下一节） | 2400 8N1、单向广播、只收不发 | 无需轮询；但字段有缺失（无均衡电流/循环次数/实际容量），总容量靠 `剩余容量 ÷ SOC` 估算 |
 | `"modbus"` | RS485 Modbus 通用协议（[JK-BMS-RS485.md](../docs/jikong/JK-BMS-RS485.md)） | 115200 8N1、主从应答、本机做主站轮询 | 字段齐全：均衡电流、循环次数、循环容量、SOH、实际容量、充/放电 MOS 状态，另可读配置区与信息区 |
 
 切换只需改 `config.lua` 的 `JK_PROTOCOL` 后重新烧录脚本；两个实现共用同一个串口与方向脚
@@ -265,7 +265,12 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 | 6 | 过温放电 | bit15 `0x8000` 或 bit1 `0x0002` | 图标偏移 78/80 |
 | 7 | 低温充电 | bit9 `0x0200` | 电池温度 ≤ `JJ_LOW_TEMP_CHARGE_C` |
 | 8 | 低温放电 | 位表无专用位 | 电池温度 ≤ `JJ_LOW_TEMP_DISCHARGE_C` |
-| 63 | 快充状态 | 充电中且电流 ≥ `JJ_FAST_CHARGE_CURRENT_MA`；主站写过"结束快充"后置 0，停充/放电后自动恢复判定 | — |
+| 63 | 快充状态 | 充电中且电流 ≥ 快充判定电流（`JJ_FAST_CHARGE_C_RATE` × 电池容量 Ah，1 = 1C）；主站写过"结束快充"后置 0，停充/放电后自动恢复判定 | — |
+
+> 快充判定用**充电倍率**而不是固定电流：阈值 = `JJ_FAST_CHARGE_C_RATE` × 快照的满电总容量
+> （`socFullChargeCapMah`，即寄存器 3/113 的容量）。`1` = 1C，即电流达到容量 Ah 的数值
+> （54Ah → 54A）；支持小数（`0.5` = 0.5C = 27A）。倍率 `0`（默认）或容量未知（0）时阈值退化为 0，
+> 等价于"只要在充电即认为快充"，与扩容前行为一致。
 
 支持的应答：`01 03` 读寄存器、`01 01` 读开关量、`01 06` 写单寄存器（1089/1090）、
 `01 05` 写单开关量（64 结束快充）；地址非法返回异常码 `02`，取值越界返回 `03`，
@@ -283,7 +288,7 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 - 鉴权：`clientId = 用户名 = device_id`（IMEI，取不到用模组唯一 ID），密码 =
   `HMAC-SHA256(MQTT_HMAC_SECRET, IMEI)` 的**小写 hex**（默认密钥 `"soc"`，纯 Lua 实现，
   见 `sha256.lua`/`hmac.lua`，连接时算一次）；服务端需按同一规则校验；
-- 主题：`<MQTT_TOPIC_PREFIX>/<device_id>/status`（默认 `/bms/<IMEI>/status`），QoS0；
+- 主题：`<MQTT_TOPIC_PREFIX>/<device_id>/status`（模板默认 `/device/<IMEI>/status`），QoS0；
   `MQTT_HOST`/`MQTT_PORT`/`MQTT_IS_SSL`/`MQTT_HMAC_SECRET`/`MQTT_QOS` 均在 `config.lua` 修改；
 - 周期：固定 `REPORT_PERIOD_MS`（默认 30s）上报一次。窗口 = 共享缓存里「上次上报游标之后
   新到达」的真实样本；游标是缓存分配的样本序号 `seq`（不是时间戳），所以同秒多条、NTP 跳变
@@ -291,8 +296,7 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 - 窗口非空 → 按实际条数编码上报；窗口为空（保护板掉线/未接入/这一周期没有新数据）→ 只发
   **0 样本帧**（`flags bit10`，`aa 01 00 80 08` + 6 个消息级 uvarint，标量取 0/上电时间/计数，
   典型 11–20 字节，`pkg/bms` §11.5 的黄金向量为 13 字节），**绝不补零、插值或沿用旧值冒充
-  采集数据**——旧实现的 keep-last 兜底会用同一时间戳反复覆盖，服务端按时间戳入库时表现为
-  "这 30s 数据被覆盖/丢了"；
+  采集数据**；
 - 帧格式（MessageV1，与 `mqttagent/pkg/bms` 字节级一致；`bms.md` §11 五条黄金向量在
   `tools/selftest.lua` 里逐字节比对）：
   `u8 0xAA | uvarint version=1 | uvarint(sampleCount-1) | uvarint header | [modeTable] |
@@ -447,15 +451,16 @@ IMEI AT 查询），**不在请求路径里**——方法调用是纯函数、�
 | `LOG_ENABLE` | true/false | 实时 |
 | `JK_MODBUS_POLL_MS` | 100–60000 | 实时 |
 | `JJ_LOW_TEMP_CHARGE_C` / `JJ_LOW_TEMP_DISCHARGE_C` | -100…100（℃） | 实时 |
-| `JJ_FAST_CHARGE_CURRENT_MA` | 0–65535（mA） | 实时 |
+| `JJ_FAST_CHARGE_C_RATE` | 0–10（C，倍率，可为小数；阈值 = 倍率 × 容量 Ah，1 = 1C，0 = 只要在充电） | 实时 |
 | `REPORT_PERIOD_MS` / `STATUS_REPORT_MS` | 1000–3600000 | `[R]` |
 | `JK_PROTOCOL` | `display` / `modbus` | `[R]` |
 | `JK_MODBUS_SLAVE_ADDR` | 1–247 | `[R]` |
 | `MQTT_PORT` `MQTT_IS_SSL` `MQTT_QOS` `MQTT_KEEPALIVE_S` `MQTT_HOST` `MQTT_TOPIC_PREFIX` | 见 `config.lua` | `[R]` |
 
 > 恢复出厂的语义：`cmd.factory_reset` 清掉 fskv 里的覆盖并置"恢复出厂待生效"，**重启后**回
-> `config.lua` 默认值（`status.get` 里 `factory_pending=true`）。旧的 `MODBUS_*` 持久化覆盖项
-> 已作废——开机加载时按"不在白名单"跳过并打日志，需要的主机侧配置用新的 `MGMT_*` 键重新下发。
+> `config.lua` 默认值（`status.get` 里 `factory_pending=true`）。开机加载时不在白名单的覆盖项
+> 会被跳过并打日志。快充倍率是 `float` 类型（白名单里唯一的非整数数值键），按 JSON number
+> 传小数（`0.5`），字符串 `"0.5"` 也接受。
 
 ### 7.4 FOTA 通道 A：URL 升级（`fota.url`，设备自己联网下载）
 
@@ -494,7 +499,7 @@ core+script 差分包；例如 `jjsoc_2052.1.0_LuatOS-SoC_Air780EPM.bin`），**
 **两条通道的数据块形态**：
 
 - **UART** 用 **BLOB 帧**：`TYPE=0x04`，载荷 = `SEQ(2 LE) | LEN(2 LE) | DATA(LEN)`，`DATA ≤ 238`；
-  **偏移由设备按已收字节自动推得**（主站不再传 offset）。设备收到 BLOB 帧后与请求帧一样回一条
+  **偏移由设备按已收字节自动推得**（主站不传 offset）。设备收到 BLOB 帧后与请求帧一样回一条
   RESP（同一 ID）：`{"ok":true,"result":{"seq":…,"rx":…,"total":…,"progress":…}}`；失败回错误码。
 - **MQTT** 用 `fota.chunk`：参数 `{"seq":<块序号，从 1 递增>,"data":"<BASE64>"}`，服务端解码后
   与 BLOB 走同一条写入路径（偏移同样由设备推得）。
@@ -538,13 +543,12 @@ core+script 差分包；例如 `jjsoc_2052.1.0_LuatOS-SoC_Air780EPM.bin`），**
 > `fota.caps.core` / `fota.status` 的 `caps.core`。缺失时一个字节的升级数据都不会写、设备仍跑
 > 旧版本（"优雅降级 + 安全失败"）。
 >
-> ⚠ **踩过的坑（本机 1.0.0-D 实测）：明明固件带 `fota`，却报 `caps.core=false` + `fota.begin`
-> 回 `ENOLIB`。** 原因不是固件裁剪，而是**判据写错了**：LuatOS 的 C 库不是 Lua table ——
-> `rotable2_newlib()`（`lua/src/rotable2.c`）把它注册成 **userdata + 元表**的只读表
-> （`type(fota) == "userdata"`、元表 `__name == "rotable"`，成员从元表 `__index` 取，
-> `fota.init()` 点号调用照常可用）。旧探针写成 `type(fota) == "table"` 于是永远判「缺库」。
-> 现在改成「`fota.init` 可调用即算有库」，并加了 `caps.core_type` 便于一眼分清；离线自测
-> §13.2b 用 userdata 形态把这个坑固定住了（旧写法会让该用例 FAIL）。
+> 判「核心库在不在」只能看 **`fota.init` 是否可调用**：LuatOS 的 C 库经 `rotable2_newlib()`
+> （`lua/src/rotable2.c`）注册成 **userdata + 元表**的只读表（`type(fota) == "userdata"`、
+> 元表 `__name == "rotable"`，成员从元表 `__index` 取，`fota.init()` 点号调用照常可用），
+> **不是** Lua table —— 用 `type(fota) == "table"` 判会误报「缺库」。`caps.core_type` 就是它
+> 的类型名字符串（`"userdata"` = 正常 LuatOS rotable、`"nil"` = 确实没有），离线自测 §13.2b
+> 用 userdata 形态覆盖这一判据。
 
 **与 URL 通道的关系**：两条通道**互斥** —— URL 正在下载时 `fota.begin` 返回 `EBUSY`，
 本地会话在忙时 `fota.url` 也返回 `EBUSY`。两条通道成功后都只置状态 2 + 「需重启」。
@@ -637,7 +641,7 @@ mosquitto_pub -h 399.run -t '/device/861234567890123/rpc' -m '{"id":3,"method":"
 
 > 认证与上报一致（同一个 clientId/用户名/密码）；broker 若开了 ACL，记得给设备放行
 > `.../rpc`（订阅）与 `.../rpc/resp`（发布）两个主题。换通道名只改 `MGMT_MQTT_SUFFIX`，
-> 响应主题固定是「订阅主题 + `/resp`」。旧 `.../modbus` 主题已失效。
+> 响应主题固定是「订阅主题 + `/resp`」。
 
 ### 7.8 UART3 引脚组与排查（极空链路，本板实测结论）
 
@@ -688,9 +692,8 @@ RS485-3 只有 ~2.8V。另外**两组都是 RX 号 > TX 号**（53>52、58>57）
    （`LPCSyncDetect failed` / `preamble no response`）；
 5. 选择 Air780EPM 固件（需含 `mqtt`、`socket.sntp`、`adc`、`gpio`、`pins` 等库）。喂狗用的是
    工程自带的 `air153C_wtd.lua`（就在脚本根目录，随脚本一起打包，**不需要**勾"添加默认 lib"；
-   但**不能把它从工程里删掉**：`board.lua` 在加载期就 require 它，取不到会导致整个脚本加载失败）；
-   官方默认扩展库 `exair153x_wdt` 已弃用——实测它按时打"喂狗完成"，本板 Air153C 却照旧按自身
-   超时复位（见本节末的两个现场条目）；
+   **不要换用官方默认扩展库 `exair153x_wdt`**，也**不能把该文件从工程里删掉**：`board.lua`
+   在加载期就 require 它，取不到会导致整个脚本加载失败（见本节末的看门狗说明）；
 5.1 **引脚复用（`pins_Air780EPM.json`）**：`UART1`（PIN17/18）、`UART2`（PIN28/29）是芯片默认复用，
    不用配；极空链路的 `UART3` 不是，本板接 PIN53/PIN52 —— 工程已带 LuatIO 生成的 D700Tm 管脚表
    `air780epm/pins_Air780EPM.json`，**记得在"脚本和资源列表"里把它一起打包下载**（进 `/luadb/`，
@@ -703,9 +706,9 @@ RS485-3 只有 ~2.8V。另外**两组都是 RX 号 > TX 号**（53>52、58>57）
    `require("字面量")`，写成 `require(变量)` 就不会被下发）；
    5.2.1 **本地 FOTA（§7.5）不需要 `libfota2`、也不需要联网**，它用的是 LuatOS **核心库**里的
    全局 `fota`（`fota.init/run/isDone/finish`）。固件裁剪掉该库时，`fota.begin` 返回 `ENOLIB`
-   （`stage=6` / `result=-1`），日志写明原因，其它功能不受影响。
-   这也是本模块从 `fota.lua` **改名 `fota_mgr.lua`** 的原因：`require "fota"` 会与核心库的
-   全局 `fota` 互相遮蔽（LuatOS 的核心库是全局表，同名会让人分不清取到的是哪一个）。
+   （`stage=6` / `result=-1`），日志写明原因，其它功能不受影响。本模块命名为 `fota_mgr.lua`
+   而不是 `fota.lua`：`require "fota"` 会与核心库的全局 `fota` 互相遮蔽（LuatOS 的核心库是
+   全局表，同名会让人分不清取到的是哪一个）。
 6. 下载脚本后自动运行，日志可见 `main jjsoc 1.0.0`、数据源选择日志
    （`jk 数据源 = …`）、`jj modbus rtu slave ready, uart 2 ... PN SOC-xxxxxxxxxxxx`，
    极空链路（UART3）：`jk 引脚复用 PIN 53 -> UART3_RX`、`jk 引脚复用 PIN 52 -> UART3_TX`，
@@ -744,32 +747,20 @@ RS485-3 只有 ~2.8V。另外**两组都是 RX 号 > TX 号**（53>52、58>57）
   **400ms 正脉冲**（拉高 → `sys.timerStart` 400ms 后拉低）。Air153C 超时随电压
   209s@4.3V~283s@3.3V，30s 有约 7 倍余量。
 
-  ⚠ **这套写法是现场试出来的唯一有效版本，别按"官方推荐用法"改回去**：官方默认扩展库
-  `exair153x_wdt`（`init{ wdt_pin = 28, auto_feed_period_s = 30 }`，库自带周期喂狗任务、
-  `init` 内先喂第一次）在 D700Tm 上**喂不动看门狗芯片**——日志里每 30s 都打"喂狗完成"，
-  芯片却照旧按自身超时（Air153C 约 237s@3.8V）切供电复位整机，复位原因报 0（`0 0 0`，
-  和正常上电/RESET 一样），现场表现就是"每隔几分钟丢一段数据"且 `stat` 计数每次归零。
-  换成 `air153C_wtd` 的 400ms 正脉冲后不再随机重启（2026-10-12 实测）。
-  `air153C_wtd.lua` 就在工程根目录、随脚本一起打包；`board.lua` 在**加载期**就 require 它，
+  ⚠ **不要改用官方默认扩展库 `exair153x_wdt`**：它在 D700Tm 上按时打"喂狗完成"，但本板
+  WTDOG 前级接法不认它的波形，Air153C 仍按自身超时（约 237s@3.8V）切供电复位整机，复位原因
+  报 0（`0 0 0`，和正常上电一样），现象是"每隔几分钟丢一段数据"且 `stat` 计数归零。
+  `air153C_wtd.lua` 必须在脚本里、随脚本一起打包；`board.lua` 在**加载期**就 require 它，
   文件丢了会让整个脚本加载失败（不是"跑起来但没喂狗"），所以不要删、也不要改成 `require(变量)`。
-- **重启排查**：`board.lua` 不再在开机时打印复位原因，改从管理链路读 `status.get` 的 `reset_reason`
-  （`pm.lastReson()` 第 3 值，见 §7.3）：`0` = powerkey/上电开机（**外置看门狗经 PMOS 切供电时
-  也报 0**）、`3` = 软件重启、`5` = RESET 脚被拉低（Luatools 下载时的硬复位、或外部电路拉低
-  RESET）、`8` = 内部看门狗重启、`9` = 外部重启。
-  **实测特征**：外置看门狗一直没吃到狗时，会按芯片自身超时（Air153C 约 237s@3.8V 供电）**稳稳地**
-  周期性切供电复位，复位原因 `0 0 0` 且间隔几乎恒定（如 00:35:24→39:22→43:19→47:16→51:13，
-  每次 237s）；而 `0 0 5` 基本都紧跟在一次 Luatools 下载之后。
-  喂狗就位时开机日志应有这两行：
-  `I/user.board GPIO 高电平输出 = 3300 mV（D700Tm 外围电路要求 3.3V）` 与
-  `WTD feed task start!`，之后每 30s 一行 `WTD feed #N done.`。
-  若现场出现"每隔几分钟丢一段数据"，先对比这段日志与 `stat` 计数是否归零。
-- **"喂狗日志一直在打，设备还是每 ~4 分钟重启一次"**（2026-10-11/10-12 两次定位）：第一次是
-  GPIO 高电平不够——开机日志里 `bsp_user_init_io ... io volt 1.8v` 说明高电平只有 1.8V，
-  3.3V 供电的 Air153C 认不出这个"高"，必须看到开机那行 `I/user.board GPIO 高电平输出 = 3300 mV`
-  （`board.lua` 硬编码 `pm.ioVol(pm.IOVOL_ALL_GPIO, 3300)`，且这条在任何喂狗动作之前/紧随其后，
-  保证第一条 400ms 喂狗脉冲大部分是 3.3V）；第二次就是喂狗波形本身——3.3V 满足后
-  `exair153x_wdt` 仍按 ~237s 周期复位，说明本板 WTDOG 前级接法不认库的波形（库按
-  GPIO→NPN→WTDOG 假设设计），换成 `air153C_wtd` 的正脉冲才喂得动。观察期间**别点 Luatools
+- **重启排查**：复位原因从管理链路读 `status.get` 的 `reset_reason`（`pm.lastReson()` 第 3 值，
+  见 §7.3）：`0` = powerkey/上电开机（**外置看门狗经 PMOS 切供电时也报 0**）、`3` = 软件重启、
+  `5` = RESET 脚被拉低（Luatools 下载时的硬复位、或外部电路拉低 RESET）、`8` = 内部看门狗重启、
+  `9` = 外部重启。看门狗没吃到狗时是"`reset_reason` 恒为 0 且复位间隔几乎恒定"（Air153C
+  约 237s@3.8V），`0 0 5` 则基本都紧跟在一次 Luatools 下载之后。
+  喂狗就位时开机日志应有这两行：`I/user.board GPIO 高电平输出 = 3300 mV（D700Tm 外围电路要求 3.3V）`
+  与 `WTD feed task start!`，之后每 30s 一行 `WTD feed #N done.`。
+- **看门狗自检**：GPIO 高电平不足（开机日志 `bsp_user_init_io ... io volt 1.8v`）时 3.3V 供电的
+  Air153C 认不出"高"，必须看到 `I/user.board GPIO 高电平输出 = 3300 mV`。观察期间**别点 Luatools
   下载**（下载本身会硬复位模组，会把结论搅乱），至少看 6 分钟（≈1.5 个超时周期）不重启才算通过。
 - 调试开关：`LOG_ENABLE`、`LOG_HEX_PAYLOAD`（整包 hex）、`LOG_RAW_FRAMES`（485 原始帧）。
 
@@ -782,11 +773,10 @@ cd air780epm
 lua tools/selftest.lua
 ```
 
-当前 745 项全部通过（64 位与 32 位整数 Lua 各跑一遍都应是同样的「失败 0 项」，见下方"位宽差异"），覆盖：
+当前 760 项全部通过（64 位与 32 位整数 Lua 各跑一遍都应是同样的「失败 0 项」，见下方"位宽差异"），覆盖：
 
-> 自测里 MQTT 主题相关的几项按**模板默认** `MQTT_TOPIC_PREFIX = "/bms"` 断言；若本地
-> `config.lua` 把它改成了别的值（例如 `/device`），这几项会 FAIL——是本地配置差异，
-> 不是代码问题（`config.lua` 不入库）。其余用例与配置无关。
+> 自测需要 `config.lua` 已配置 `MQTT_HOST`（模板里留空 = 关闭 4G 上报；留空时上报相关用例会
+> FAIL，属配置差异而非代码问题）。主题前缀直接从 `config` 读取，不写死。
 
 1. `bms_codec`（MessageV1）与 `mqttagent/pkg/bms` §11 的**五条黄金向量字节级比对**：
    11.1 两样本×三电芯 = **53B**、11.2 三样本×两电芯全静态 = **42B**（modeTable 全常量）、
@@ -837,14 +827,14 @@ lua tools/selftest.lua
 12. `cfg_store`：白名单/类型/范围校验（未知键、越界、枚举、类型、超长全部拒绝）、写透往返
     （打桩 fskv 存 JSON 文本）、重启等价（新实例 `load()` 把覆盖在业务模块加载前写回 config）、
     非法/未知项跳过、恢复出厂清键并置待生效、fskv 缺失时降级为「不持久化」但本次运行仍生效；
-13. `fota_mgr`（原 `fota`，改名见 §8 5.2.1）：
+13. `fota_mgr`：
     URL 通道——打桩 `libfota2` 下的状态机（idle→下载中→成功待重启/失败）、进度回调与结果码、
     未联网不发起下载（联网后才调 `request`）、忙时拒绝、空 URL 拒绝、库缺失时优雅降级；
     本地通道——打桩核心库 `fota`（**按真实返回形状**：`run → (ok, isDone, cache)`、
     `isDone → (ok, done)`）下的状态机（idle→preparing→ready→receiving→verifying→
     success）、init/run 失败、`isDone` 超时·报错、CRC32 不匹配、主动中止、空闲超时、
     核心库缺失（`-1`）、同块幂等重试（不重复写 Flash）、顺序/偏移/长度校验、两条通道互斥、
-    不调用 legacy `fota.wait()`（返回 false 也不影响）、`run` 第三个返回值作为未落盘缓存上报、
+    `fota.wait()` 的返回值不参与流程（返回 false 也不影响）、`run` 第三个返回值作为未落盘缓存上报、
     全程不联网也不碰 `libfota2`；另核对标准 CRC32 向量与一条**位宽守卫**用例
     （新模块源码里不允许出现 32 位整数 Lua 装不下的整数字面量，见下方"位宽差异"）；
 14. `mgmt_uart` 传输（§7.1）：管理链路走 UART1 时不做 `pins.setup`（默认复用功能）、串口参数
@@ -882,21 +872,21 @@ lua tools/selftest.lua
 另覆盖引脚复用按固定路径 `/luadb/pins_Air780EPM.json` 加载并记录成功日志、表没随脚本下发或
 老固件没有 `pins.loadjson` 时只告警不崩（都不影响喂狗）、供电电压 ADC0 的换算。
 
-### 位宽差异：PC 的 64 位 Lua ≠ 固件的 32 位 Lua（2026-10-12 踩坑）
+### 位宽差异：PC 的 64 位 Lua ≠ 固件的 32 位 Lua
 
 固件里的 Lua 是 **32 位整数**（`LUA_32BITS`，开机日志 `LuatOS@Air780EPM … 32bit`），而 PC 上的
-Lua 5.4 是 64 位整数，于是有一类 bug **PC 自测全绿、烧到设备才炸**：
+Lua 5.4 是 64 位整数，所以有一类 bug **PC 自测全绿、烧到设备才炸**：
 
-- `0x100000000` 在 32 位下回绕成 `0`，`sha256.lua` 里 `bits // 0x100000000` 就成了「除以 0」。
-  现场表现：烧录后 `E/user.coroutine.resume sha256.lua:50: attempt to divide by zero`（MQTT 鉴权
-  算密码时抛错）→ `Lua VM exit!! reboot in 15000ms`，设备每 15s 重启一次；
+- `0x100000000` 在 32 位下回绕成 `0`，`sha256.lua` 里 `bits // 0x100000000` 就成了「除以 0」
+  （烧录后 `E/user.coroutine.resume sha256.lua:50: attempt to divide by zero`，MQTT 鉴权算密码
+  时抛错 → 设备每 15s 重启一次）；
 - `v > 0xFFFFFFFF`（高位常量比较）同理恒为真 → 上报的总压/剩余容量被钳成 0（无符号列写出 0）。
-- **本次新增的 CRC32（`fota_mgr.crc32`，§7.5）正是按这条规则写的**：掩码与多项式都用能装进
-  32 位整数的片段拼出来（`MASK32 = (0xFFFF << 16) | 0xFFFF`、`CRC32_POLY = (0xEDB8 << 16) | 0x8320`），
-  **不能**直接写 `0xFFFFFFFF` / `0xEDB88320`，而且每一步移位/异或后都重新掩码；
-  离线自测里有一条"位宽守卫"用例（§13 末）专门卡这类字面量。
-  （PC 侧探针 `Get-Crc32` 有同一个坑的另一半：PowerShell 的 `0xEDB88320` 会解析成
-  负的 Int32，`[uint32]0xEDB88320` 直接抛异常——所以那边用 `[int64]` + 掩码实现。）
+- `fota_mgr.crc32`（§7.5）按这条规则写：掩码与多项式都用能装进 32 位整数的片段拼出来
+  （`MASK32 = (0xFFFF << 16) | 0xFFFF`、`CRC32_POLY = (0xEDB8 << 16) | 0x8320`），**不能**直接写
+  `0xFFFFFFFF` / `0xEDB88320`，而且每一步移位/异或后都重新掩码；离线自测里有一条"位宽守卫"
+  用例（§13 末）专门卡这类字面量。
+  （PC 侧探针 `Get-Crc32` 有对应的另一半限制：PowerShell 的 `0xEDB88320` 会解析成负的 Int32，
+  `[uint32]0xEDB88320` 直接抛异常——所以那边用 `[int64]` + 掩码实现。）
 
 结论：**位运算 / 高位常量 / 计时（`mcu.ticks`）/ `os.time` 相关的改动，必须用 32 位整数 Lua 再跑一遍
 同一套自测**（两份 Lua 的结果应一致：失败 0 项；`tools/selftest.lua` 里的「位宽守卫」用例会把
@@ -930,7 +920,7 @@ cd <工程>/air780epm && <刚构建的>/src/lua tools/selftest.lua
 | 报警位 | 两套协议的 `sysAlarm` 32 位定义一致（bit1 MOS 过温、bit7 充电短路、bit8 充电过温、bit9 充电低温、bit14 放电短路、bit15 放电过温），故金箭保护开关量的判断逻辑两种数据源共用 |
 | 单体颜色帧 | RGB565 颜色码（非均衡线电阻表），本项目仅用于诊断 |
 | 串数上限 | 主块 24 槽 + `0x2011` 第 25 节 = 25 路；车端金箭链路按协议只暴露 24 路 |
-| 硬件看门狗 | 用工程自带的 `air153C_wtd`（`init(28)` + 开机喂一次 + 每 30s 一个 400ms 正脉冲），**不用**官方默认扩展库 `exair153x_wdt`：后者在 D700Tm 上按时打"喂狗完成"但 Air153C 照旧按自身超时（实测 237s@3.8V）复位整机。代价是喂狗波形写死在 `board.lua`，换板/换看门狗芯片要重新实测波形；且该库文件必须在脚本里（丢了会导致脚本加载失败，不是静默降级） |
+| 硬件看门狗 | 用工程自带的 `air153C_wtd`（`init(28)` + 开机喂一次 + 每 30s 一个 400ms 正脉冲），**不用**官方默认扩展库 `exair153x_wdt`：后者在 D700Tm 上按时打"喂狗完成"但 Air153C 照旧按自身超时（约 237s@3.8V）复位整机。代价是喂狗波形写死在 `board.lua`，换板/换看门狗芯片要重新实测波形；且该库文件必须在脚本里（丢了会导致脚本加载失败） |
 | RS485-1 管理链路 | **一个统一管理服务 + 两条传输**：UART1 走自定义裸帧 RPC（115200 8N1，点对点无从站地址）、MQTT 走 JSON-RPC（通道后缀 `rpc`）。只应答管理主站的请求，主站不来问就一个字节都不发；写配置走白名单 + 范围校验并**写透** fskv，`[R]` 项重启生效；命令（重启/FOTA/恢复出厂）**回帧先于动作** + 10s/ID 去重。管理链路与极空（RS485-3）、金箭（RS485-2）物理/逻辑独立，互不影响 |
 | 配置持久化 | fskv 明文存「覆盖项 JSON」，只存被主站改过的键（不是整份 config），开机在业务模块 `require` 之前写回 config；`CFG_STORE_ENABLE=false` 或 fskv 不可用时退化为"每次重启都回 config.lua"，只告警不报错。MQTT 口令随其它配置一起明文存储（沿用"凭据随脚本下发"的既有基线，不引入加密） |
 | FOTA（URL 通道） | 管理主站下发 URL 触发 `libfota2` 下载；**下载成功不自动重启**（置状态 2 + 「需重启」，等主站发重启命令），现场可选合适时间点重启，避免下完就断服；FOTA 与上报共用 4G 链路，未联网不启动（限时等待后置失败） |
@@ -972,7 +962,7 @@ LuatOS 是**单线程协作式**调度：任何任务长时间不让出，都会
    改成"限时等待 + 周期打印"，超时只是可观测性，不是阻塞。
 8. **事件不排队**：`sys.publish` 只保留最后一次事件值，消费端不及时会丢轮。
    `JK_ROUND` 只有 `bms_data` 一个消费端，每条只做一次字段映射（微秒级）后立即 `push`
-   进共享缓存；金箭从机与 4G 上报都不再监听事件，而是**只读缓存**（`latest` / `since`），
+   进共享缓存；金箭从机与 4G 上报都**只读缓存**（`latest` / `since`）、不监听事件，
    所以上报任务偶发卡顿只影响「窗口大小」，不会丢轮、也不会复用到正在编码的缓冲。
    缓存被环形覆盖而没来得及上报的样本计入 `stat` 的 `lost`（`bms_uplink.get_stats().lost`）。
 9. **喂狗也是普通 sys 任务**：`board.lua` 的看门狗任务 `sys.wait(WTD_FEED_MS)`（30s）挂起
