@@ -237,9 +237,10 @@ local function column_payload(col, mode)
 end
 
 -- 与 Go chooseColumnMode 一致: 恒短才换模式（顺序也一样：delta → 常量 → 线性 → 二阶）
-local function choose_column_mode(col)
+-- baseline = 调用方已经算好的 mode0（无压缩）负载：传进来可省掉一遍重复编码
+local function choose_column_mode(col, baseline)
     local bestMode = 0
-    local best = column_payload(col, 0)
+    local best = baseline or column_payload(col, 0)
 
     if col.const then
         local cand = column_payload(col, 2)
@@ -264,9 +265,11 @@ end
 -- 电芯两布局 (offset / spatial) 与整体编码
 --------------------------------------------------------------------------------
 
-local function build_columns(hist, cellSpatial)
+-- 前 9 列（温度/电流/容量/时间）与电芯布局无关：两种布局共用同一份列上下文，
+-- 避免同一批数据被建表 + 编码两遍（每条列上下文含两个 delta 表，重复构建是纯浪费）
+local function build_common_columns(hist)
     local n = hist.count
-    local cols = {
+    return {
         make_column(hist.temp1, n, true),
         make_column(hist.temp2, n, true),
         make_column(hist.tempMos, n, true),
@@ -277,7 +280,12 @@ local function build_columns(hist, cellSpatial)
         make_column(hist.socCapRemain, n, false),
         make_column(hist.time, n, false),
     }
+end
 
+-- 电芯列：首列（base）+ 各节相对 base 的差；offset / spatial 两种布局各建一套
+local function build_cell_columns(hist, cellSpatial)
+    local n = hist.count
+    local cols = {}
     local cellCount = hist.cellCount
     if cellCount and cellCount > 0 then
         local cv = hist.cellVols
@@ -305,6 +313,18 @@ local function build_columns(hist, cellSpatial)
     return cols
 end
 
+-- 公共列 + 电芯列 → 一整套列（只复制引用，不复制列上下文）
+local function merge_columns(common, extra)
+    local cols = {}
+    for i = 1, #common do
+        cols[i] = common[i]
+    end
+    for i = 1, #extra do
+        cols[#cols + 1] = extra[i]
+    end
+    return cols
+end
+
 -- 每处理这么多列回调一次 on_slice，供上层插入 sys.wait 让出调度（见文件头说明）
 local SLICE_COLUMNS = 16
 
@@ -327,7 +347,8 @@ local function encode_columns(cols, count, cellCount, cellSpatial, scalars, on_s
     for i = 1, #cols do
         local col = cols[i]
         defaults[i] = column_payload(col, 0)
-        local mode, best = choose_column_mode(col)
+        -- 复用上面刚算好的 mode0 负载，避免每列重复编码一遍
+        local mode, best = choose_column_mode(col, defaults[i])
         if mode ~= 0 and #best < #defaults[i] then
             modes[i] = mode
             encoded[i] = best
@@ -390,9 +411,13 @@ function M.encode(hist, meta, on_slice)
     end
 
     local scalars = encode_scalars(meta)
-    local best = encode_columns(build_columns(hist, false), n, c, false, scalars, on_slice)
+    -- 公共列（前 9 列）只建一次，只有电芯列按两种布局各建一套
+    local common = build_common_columns(hist)
+    local best = encode_columns(merge_columns(common, build_cell_columns(hist, false)),
+        n, c, false, scalars, on_slice)
     if c > 0 then
-        local cand = encode_columns(build_columns(hist, true), n, c, true, scalars, on_slice)
+        local cand = encode_columns(merge_columns(common, build_cell_columns(hist, true)),
+            n, c, true, scalars, on_slice)
         if #cand < #best then
             best = cand
         end

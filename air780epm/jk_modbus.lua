@@ -42,7 +42,8 @@
   jk_modbus.feed(bytes)   注入一段从机响应字节流（离线测试用）
   jk_modbus.stop()        停止轮询（离线测试用）
 
-每完成一轮完整轮询（单体电压 + 电池状态 + 汇总三块全部成功）发布一次 "JK_ROUND"，
+每完成一轮轮询（单体电压 + 电池状态 + 汇总必需字段全部成功）发布一次 "JK_ROUND"，
+汇总可选字段失败时仍发布核心样本，并在 state.modbusComplete 标记不完整；
 携带本轮 state，供 bms_uplink 按“一轮一条样本”的粒度入队；state 字段与 jk_display
 保持同名字段（batVolMv/batCurrentMa/soc/cells/tempBatC/tempMosC/fullCapMah/…），
 并额外提供 modbus 独有字段（tempBat2C/balanCurrentMa/cycleCount/soh/bmsUpTimeS/…）。
@@ -60,11 +61,33 @@ local SLAVE   = cfg.JK_MODBUS_SLAVE_ADDR or 1
 local UART_ID = cfg.JK_UART_ID
 
 --=============================================================================
--- 寄存器地址与汇总块下标（与 esp32/main/jk_bms.c 一致）
+-- 寄存器地址与汇总块下标（与 esp32/main/jk_bms.c 的字段映射一致）
 --=============================================================================
 local REG_CELLS,     NUM_CELLS     = 0x1200, 32 -- 单体电压 mV
 local REG_CELL_STA,  NUM_CELL_STA  = 0x1240, 2  -- CellSta 在位位图 u32
-local REG_STATS,     NUM_STATS     = 0x128A, 58 -- 温度/电流/容量/报警等汇总
+
+-- 极空的“寄存器地址”实际按字节偏移组织，同一固件只保证单个实体按其自身宽度可读。
+-- 实测 0x128A 即使用 x32 也会被静默丢弃；社区 esphome-jk-bms 同样按实体逐个请求
+-- （0x128A x1、0x1290 x2、0x1298 x2…），不能把汇总区合并成一个大块。
+-- base 仍是相对 0x128A 的 1 基 16-bit 寄存器下标，用来兼容 build_state 的既有映射。
+local STAT_READS = {
+    { reg = 0x128A, num = 1, base = 1,  required = false, field = "TempMos" },
+    { reg = 0x1290, num = 2, base = 7,  required = true,  field = "BatVol" },
+    { reg = 0x1298, num = 2, base = 15, required = true,  field = "BatCurrent" },
+    { reg = 0x129C, num = 1, base = 19, required = false, field = "TempBat1" },
+    { reg = 0x129E, num = 1, base = 21, required = false, field = "TempBat2" },
+    { reg = 0x12A0, num = 2, base = 23, required = false, field = "Alarm" },
+    { reg = 0x12A4, num = 1, base = 27, required = false, field = "BalanCurrent" },
+    { reg = 0x12A6, num = 1, base = 29, required = true,  field = "SOC" },
+    { reg = 0x12A8, num = 2, base = 31, required = false, field = "SOCCapRemain" },
+    { reg = 0x12AC, num = 2, base = 35, required = false, field = "SOCFullChargeCap" },
+    { reg = 0x12B0, num = 2, base = 39, required = false, field = "SOCCycleCount" },
+    { reg = 0x12B4, num = 2, base = 43, required = false, field = "SOCCycleCap" },
+    { reg = 0x12B8, num = 1, base = 47, required = false, field = "SOCSOH" },
+    { reg = 0x12BC, num = 2, base = 51, required = false, field = "RunTime" },
+    { reg = 0x12C0, num = 1, base = 55, required = false, field = "ChargeState" },
+    { reg = 0x12C2, num = 1, base = 57, required = false, field = "UserAlarm2" },
+}
 
 -- 汇总块（0x128A 起）的 1 基寄存器下标
 local ST_TEMP_MOS                      = 1      -- 0x128A
@@ -114,7 +137,7 @@ local function to_hex(s)
 end
 
 -- 原始帧十六进制限频打印：LOG_RAW_FRAMES 打开时每 LOG_HEX_EVERY_N 帧打一次。
--- 轮询每秒 3 帧、单帧最多 245 字节（490 字符），不限频会让日志本身挤占调度。
+-- 汇总区按实体读取，一轮最多 18 帧；单帧最多 69 字节（138 字符），仍应限频。
 local hex_dumps = 0
 local function d_hex(tag, s)
     if not cfg.LOG_RAW_FRAMES then
@@ -206,15 +229,20 @@ end
 local stats = {
     frames = 0,        -- 收到的合法响应帧数
     rounds = 0,        -- 成功完成的轮询轮数（= 收到极空数据的次数）
+    degraded = 0,      -- 成功但缺少可选尾部状态块的轮数
+    degraded_streak = 0,
     cycles = 0,        -- 发起过的轮询轮数（含失败）
     cycles_failed = 0, -- 有任一数据块读取失败的轮数
     fail_streak = 0,   -- 连续失败轮数（用于退避与现场判断）
     requests = 0,      -- 发出的读寄存器请求数
+    rx_bytes = 0,      -- 串口收到的原始字节数（0 = 保护板没有任何回传）
+    tx_bytes = 0,      -- 串口发出的原始字节数
     timeouts = 0,      -- 请求无响应的次数
     late_frames = 0,   -- 没有任何请求在途时收到的帧（迟到/噪声，直接丢弃）
     bad_response = 0,  -- 响应 CRC/地址/字节数非法的次数
     bad_crc = 0,       -- 收帧过程中 CRC 错误次数
-    resync = 0,        -- 因地址/功能码不合法丢弃的字节数（重新同步）
+    bytecount_mismatch = 0, -- 地址/功能码像响应，但字节数不符合当前请求（常见于 TX 回显）
+    resync = 0,        -- 因地址/功能码/字节数不匹配而丢弃的字节数（重新同步）
     last_error = nil,
     last_round_ms = nil, -- 最近一轮成功的 tick(ms)
 }
@@ -224,40 +252,84 @@ local stats = {
 --=============================================================================
 local rxb = ""
 local awaiting = false -- 只有请求在途时收到的帧才予受理，避免迟到帧被配给下一个请求
+local expected_num = nil -- 当前请求期望的寄存器数；用来拒绝上一请求的回显/迟到帧
 
 local function extract_frames()
-    while #rxb >= 5 do
-        local addr = string.byte(rxb, 1)
-        local func = string.byte(rxb, 2)
-        local total = 0
-        if addr == SLAVE and func == FUNC_READ_REGS then
-            total = 5 + string.byte(rxb, 3)
-        elseif addr == SLAVE and func == FUNC_READ_REGS_ERR then
-            total = 5
-        end
+    local pos = 1
+    local hold = nil -- 尾部不完整候选帧的起点；不能在噪声后把它截掉
 
-        if total == 0 then
-            -- 非本机地址 / 不支持的功能码：跳过 1 字节重新同步
-            stats.resync = stats.resync + 1
-            rxb = rxb:sub(2)
-        elseif #rxb < total then
-            return -- 帧还不完整，等下一批
-        else
-            local frame = rxb:sub(1, total)
+    while pos <= #rxb do
+        local addr = string.byte(rxb, pos)
+        local func = string.byte(rxb, pos + 1)
+
+        if addr ~= SLAVE or (func ~= FUNC_READ_REGS and func ~= FUNC_READ_REGS_ERR) then
+            pos = pos + 1
+        elseif func == FUNC_READ_REGS_ERR then
+            if #rxb - pos + 1 < 5 then
+                hold = awaiting and pos or nil
+                break
+            end
+            local frame = rxb:sub(pos, pos + 4)
             if crc_ok(frame) then
-                rxb = rxb:sub(total + 1)
+                stats.resync = stats.resync + (pos - 1)
+                rxb = rxb:sub(pos + 5)
+                pos = 1
                 if awaiting then
                     stats.frames = stats.frames + 1
                     sys.publish("JK_MB_RX", frame)
                 else
-                    -- 上一请求超时后迟到的响应 / 总线噪声：丢弃
                     stats.late_frames = stats.late_frames + 1
                 end
             else
                 stats.bad_crc = stats.bad_crc + 1
-                rxb = rxb:sub(2)
+                pos = pos + 1
+            end
+        else
+            local byte_count = string.byte(rxb, pos + 2)
+            if not byte_count then
+                hold = awaiting and pos or nil
+                break
+            end
+            -- 115200 半双工总线有时会把刚发出的请求回显到 RX。请求帧的第三字节
+            -- 是起始地址高字节，绝不是当前响应的字节数；按期望长度过滤后再扫，
+            -- 可以跨过回显/噪声找到真正的响应，而不是把回显当帧头等超时。
+            if expected_num and byte_count ~= expected_num * 2 then
+                stats.bytecount_mismatch = stats.bytecount_mismatch + 1
+                pos = pos + 1
+            elseif byte_count == 0 or (byte_count & 1) ~= 0 or byte_count > 250 then
+                stats.resync = stats.resync + 1
+                pos = pos + 1
+            else
+                local total = 5 + byte_count
+                if #rxb - pos + 1 < total then
+                    hold = awaiting and pos or nil
+                    break
+                end
+                local frame = rxb:sub(pos, pos + total - 1)
+                if crc_ok(frame) then
+                    stats.resync = stats.resync + (pos - 1)
+                    rxb = rxb:sub(pos + total)
+                    pos = 1
+                    if awaiting then
+                        stats.frames = stats.frames + 1
+                        sys.publish("JK_MB_RX", frame)
+                    else
+                        stats.late_frames = stats.late_frames + 1
+                    end
+                else
+                    stats.bad_crc = stats.bad_crc + 1
+                    pos = pos + 1
+                end
             end
         end
+    end
+
+    if hold then
+        stats.resync = stats.resync + (hold - 1)
+        rxb = rxb:sub(hold)
+    elseif pos > #rxb then
+        stats.resync = stats.resync + (pos - 1)
+        rxb = ""
     end
 end
 
@@ -269,6 +341,7 @@ local function on_receive(id)
     repeat
         s = uart.read(id, 256)
         if s and #s > 0 then
+            stats.rx_bytes = stats.rx_bytes + #s
             rxb = rxb .. s
         end
     until not s or #s == 0
@@ -284,12 +357,15 @@ local function request_read(start, num)
     rxb = ""
     local req = M.build_read_request(start, num)
     d_hex("TX", req)
+    expected_num = num
     awaiting = true
     uart.write(UART_ID, req)
     stats.requests = stats.requests + 1
+    stats.tx_bytes = stats.tx_bytes + #req
 
     local ok, frame = sys.waitUntil("JK_MB_RX", cfg.JK_MODBUS_TIMEOUT_MS)
     awaiting = false
+    expected_num = nil
     if not ok or not frame then
         stats.timeouts = stats.timeouts + 1
         stats.last_error = string.format("read 0x%04X x%d timeout", start, num)
@@ -356,7 +432,7 @@ end
 --=============================================================================
 -- 一轮数据 → 快照（字段与 jk_display 同名，另带 modbus 独有字段）
 --=============================================================================
-local function build_state(cells, cell_stats, st)
+local function build_state(cells, cell_stats, st, complete)
     local cell_sta    = u32(cell_stats, 1, 2)
     local bat_vol_mv  = u32(st, ST_BATVOL_HI, ST_BATVOL_LO)
     local current_ma  = s32(st, ST_CUR_HI, ST_CUR_LO)
@@ -446,6 +522,7 @@ local function build_state(cells, cell_stats, st)
         valid           = true,
         stale           = false,
         source          = "modbus",
+        modbusComplete  = complete and true or false,
         cellCount       = cellCount,
         cells           = out,            -- [1..32] mV
         batVolMv        = bat_vol_mv,
@@ -495,15 +572,45 @@ end
 local function poll_once()
     local cells      = request_read(REG_CELLS, NUM_CELLS)
     local cell_stats = request_read(REG_CELL_STA, NUM_CELL_STA)
-    local st         = request_read(REG_STATS, NUM_STATS)
+
+    local st, complete = {}, true
+    local optional_error
+    local required_ok = true
+    for _, read in ipairs(STAT_READS) do
+        local regs, err = request_read(read.reg, read.num)
+        if regs then
+            for i = 1, read.num do
+                st[read.base + i - 1] = regs[i]
+            end
+        else
+            complete = false
+            if read.required then
+                required_ok = false
+            end
+            optional_error = optional_error or string.format("0x%04X %s: %s",
+                read.reg, read.field, tostring(err))
+        end
+    end
 
     stats.cycles = stats.cycles + 1
-    if cells and cell_stats and st then
+    if cells and cell_stats and required_ok then
         if stats.fail_streak > 0 then
             d_info("poll recovered after", stats.fail_streak, "failed rounds")
         end
         stats.fail_streak = 0
-        build_state(cells, cell_stats, st)
+        if complete then
+            if stats.degraded_streak > 0 then
+                d_info("poll complete after", stats.degraded_streak, "degraded rounds")
+            end
+            stats.degraded_streak = 0
+        else
+            stats.degraded = stats.degraded + 1
+            stats.degraded_streak = stats.degraded_streak + 1
+            if stats.degraded_streak == 1 or stats.degraded_streak % 60 == 0 then
+                d_warn("poll degraded", stats.degraded_streak, "times:", optional_error)
+            end
+        end
+        build_state(cells, cell_stats, st, complete)
         return true
     end
 
@@ -573,7 +680,8 @@ sys.taskInit(function()
                 -- 失败退避：单轮最多 3 次超时（3 × JK_MODBUS_TIMEOUT_MS），
                 -- 保护板掉线时不要以 1s 节奏反复重试并刷日志
                 if stats.fail_streak == 1 or stats.fail_streak % 10 == 0 then
-                    d_warn("poll failed", stats.fail_streak, "times, retry in", retry_ms, "ms")
+                    d_warn("poll failed", stats.fail_streak, "times, last_error:",
+                        stats.last_error or "unknown", "retry in", retry_ms, "ms")
                 end
                 sys.wait(retry_ms)
             end

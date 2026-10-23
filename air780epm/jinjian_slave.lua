@@ -68,9 +68,11 @@ end
 --=============================================================================
 -- Modbus CRC16（0xA001 多项式，低字节在前）
 --=============================================================================
-local function crc16(s)
+-- 就地算 [off, off+n-1] 的 CRC（不造子串）：帧扫描要对每个偏移试一遍，
+-- 用 s:sub(...) 会产出大量短命字符串，噪声/粘包时是纯粹的 GC 压力
+local function crc16_range(s, off, n)
     local crc = 0xFFFF
-    for i = 1, #s do
+    for i = off, off + n - 1 do
         crc = crc ~ string.byte(s, i)
         for _ = 1, 8 do
             if (crc & 1) ~= 0 then
@@ -83,18 +85,23 @@ local function crc16(s)
     return crc & 0xFFFF
 end
 
+local function crc16(s)
+    return crc16_range(s, 1, #s)
+end
+
 local function append_crc(body)
     local crc = crc16(body)
     return body .. string.char(crc & 0xFF, (crc >> 8) & 0xFF)
 end
 
-local function crc_ok(frame)
-    if #frame < 4 then
+-- 就地校验 [off, off+need-1] 这一帧的 CRC（不造子串）
+local function crc_ok_at(buf, off, need)
+    if need < 4 then
         return false
     end
-    local calc = crc16(frame:sub(1, #frame - 2))
-    return string.byte(frame, #frame - 1) == (calc & 0xFF)
-       and string.byte(frame, #frame) == ((calc >> 8) & 0xFF)
+    local calc = crc16_range(buf, off, need - 2)
+    return string.byte(buf, off + need - 2) == (calc & 0xFF)
+       and string.byte(buf, off + need - 1) == ((calc >> 8) & 0xFF)
 end
 
 -- 十六进制字符串（LuatOS 的 string:toHex() 在 PC Lua 上不存在，这里自备）
@@ -282,7 +289,9 @@ local function reg_value(addr)
     elseif addr == 5 then                                 -- 充电电流 0.01A
         if not s then return 0 end
         return to_i16(s.batCurrentMa / 10)
-    elseif addr == 6 or addr == 7 then                    -- 电池温度 2 / 1
+    elseif addr == 6 then                                 -- 电池温度 2
+        return to_i16(s and (s.tempBat2C or s.tempBat1C) or 0)
+    elseif addr == 7 then                                 -- 电池温度 1
         return to_i16(s and s.tempBat1C or 0)
     elseif addr == 8 then                                 -- 板温
         return to_i16(s and s.tempMosC or 0)
@@ -495,14 +504,17 @@ local function request_len_at(buf, off) -- off 为 1 基下标
     return 8
 end
 
+-- 找到第一个 CRC 正确的完整帧；返回 frame(字符串), 偏移, 长度
+--   代价说明：噪声/粘包时缓冲里没有完整帧，这里要对**每个偏移**试一次定长 + CRC
+--   （512 字节缓冲最坏 ~509 次）。所以校验一律就地做（crc_ok_at），
+--   只有真正命中的那一帧才 buf:sub 出字符串 —— 不产生短命字符串，只有纯算术。
+--   刻意不按"从站地址 == 本机"预筛：非本机地址的合法帧也要被消费掉并计入
+--   stats.ignored，否则它们会滞留在缓冲里挡住后续属于本机的帧（见 handle_request）。
 local function scan_frame(buf)
     for off = 1, #buf - 3 do
         local need = request_len_at(buf, off)
-        if need > 0 and off + need - 1 <= #buf then
-            local frame = buf:sub(off, off + need - 1)
-            if crc_ok(frame) then
-                return frame, off, need
-            end
+        if need > 0 and off + need - 1 <= #buf and crc_ok_at(buf, off, need) then
+            return buf:sub(off, off + need - 1), off, need
         end
     end
     return nil

@@ -21,6 +21,8 @@ RS485-1/UART1 上的管理链路：主站（USB-RS485 + `tools/mgmt_probe.ps1`�
     突发帧流按 MGMT_PARSE_MAX_FRAMES 分批让出；
   · 回帧先于动作：命令类动作（重启/FOTA）由 mgmt 在响应之后才排期；
   · 事件（hello / fota）只在 UART 传输发，排队后由任务写回（MQTT 纯请求-应答，不发事件）；
+    事件队列有上限（EVT_QUEUE_MAX = 16）：串口打不开或已 stop 时没人消费，满了丢最旧
+    并计入 stats.evt_drop（退出/停止时同时退订 MGMT_EVT 并清空队列）；
   · 单帧处理整体包一层 pcall：坏帧/异常只丢这一帧，绝不把串口任务打死。
 
 引脚：本板 RS485-1 接 UART1（PIN18=UART1_TXD、PIN17=UART1_RXD，默认复用，不用 pins.setup）；
@@ -198,6 +200,7 @@ function M.new(opts)
         sync = 0,         -- 重同步丢弃的字节数
         drop = 0,         -- 接收缓冲溢出丢弃的字节数
         errors = 0,       -- 处理异常/编码失败次数
+        evt_drop = 0,     -- 事件队列满而丢弃的事件帧数
         opened = false,
         echo_chunks = 0,  -- 诊断模式回显次数
         heartbeats = 0,   -- 诊断模式心跳个数
@@ -384,9 +387,22 @@ function M.new(opts)
     end
 
     --======================= 事件队列 =======================
+    -- 事件只能由传输任务写出（flush_evts）。串口打不开 / 已 stop 时没人消费，
+    -- 所以队列必须有上限：满了丢最旧并计数（事件是提示性的，主站可以重问）。
+    local EVT_QUEUE_MAX = 16
+
+    local function queue_evt(evt, data)
+        if #evt_queue >= EVT_QUEUE_MAX then
+            table.remove(evt_queue, 1)
+            stats.evt_drop = stats.evt_drop + 1
+            d_warn("事件队列满（", EVT_QUEUE_MAX, "条），丢弃最旧事件")
+        end
+        evt_queue[#evt_queue + 1] = { evt = evt, data = data }
+    end
+
     local function on_mgmt_evt(e)
         if type(e) == "table" and e.evt then
-            evt_queue[#evt_queue + 1] = e
+            queue_evt(e.evt, e.data)
             -- 唤醒解析任务把事件写出去（否则要等 waitUntil 的 1s 超时）
             if sys and sys.publish then
                 pcall(sys.publish, "MGMT_RX")
@@ -414,6 +430,12 @@ function M.new(opts)
         sys.taskInit(function()
             if not (uart and uart.setup) then
                 d_warn("uart 库不可用，管理 UART 传输退出")
+                -- 没人消费事件队列了：退订 + 清空，避免队列一直堆
+                evt_queue = {}
+                if sys and sys.unsubscribe then
+                    pcall(sys.unsubscribe, "MGMT_EVT", on_mgmt_evt)
+                end
+                running, stopped = false, true
                 return
             end
             local uart_pins = require "uart_pins"
@@ -435,7 +457,7 @@ function M.new(opts)
                         sys.taskInit(function()
                             sys.wait(1000)
                             if not stopped then
-                                evt_queue[#evt_queue + 1] = { evt = "hello", data = mgmt:hello() }
+                                queue_evt("hello", mgmt:hello())
                                 if sys and sys.publish then
                                     pcall(sys.publish, "MGMT_RX")
                                 end
@@ -463,6 +485,7 @@ function M.new(opts)
     self.stop = function(_)
         stopped = true
         running = false
+        evt_queue = {}                       -- 不再消费了：清掉待发事件
         if sys and sys.unsubscribe then
             pcall(sys.unsubscribe, "MGMT_EVT", on_mgmt_evt)
         end
@@ -506,7 +529,7 @@ function M.new(opts)
         rx = ""
     end
     self.push_evt = function(_, evt, data)
-        evt_queue[#evt_queue + 1] = { evt = evt, data = data }
+        queue_evt(evt, data)
         if sys and sys.publish then
             pcall(sys.publish, "MGMT_RX")
         end

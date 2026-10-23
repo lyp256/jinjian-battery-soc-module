@@ -354,6 +354,10 @@ local function start_finalize()
     lstage = M.STAGE.VERIFYING
     d_info("本地升级数据收齐：", lrx, "/", ltotal, "字节，开始收尾校验")
     sys.taskInit(function()
+        -- ⚠ sys.taskInit 会**立刻**把任务跑到第一个 yield 为止（不是延迟执行），
+        --    这里先让出一次：最后一块的响应帧先发回主站，再做 isDone/CRC/finish
+        --    （收尾最长要等 FINALIZE_MS + 写 Flash，不能占着 RPC 应答路径）。
+        sys.wait(1)
         finalize_local()
     end)
 end
@@ -390,7 +394,11 @@ function M.local_begin(total, crc32_expect, flags)
     d_info("本地升级开始：总长", total, "字节，CRC32", lcrc_expect)
 
     -- 核心库 init/wait 可能阻塞：放后台任务，管理 RPC 侧立即返回「已受理」
+    -- ⚠ sys.taskInit 会立刻把任务跑到第一个 yield 为止，所以任务体第一行必须先让出：
+    --    否则 fota.init()（Flash 准备）会同步跑在调用者的上下文里（UART 传输任务 /
+    --    MQTT 消息泵），既挡住「回帧先于动作」，又会拖住串口接收。
     sys.taskInit(function()
+        sys.wait(1)
         local ok, err = pcall(core.init)
         if not ok or err == false then
             fail_local(-10, "fota.init 失败: " .. tostring(err))

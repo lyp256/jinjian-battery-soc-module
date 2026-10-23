@@ -1,2 +1,4 @@
 air780epm/config.lua
 bin/
+.vscode/
+.devcontainer

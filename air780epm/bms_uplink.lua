@@ -35,7 +35,7 @@
   bms_uplink.flush()          立即按当前游标上报一次（调试用）
 
 MQTT 总线（把这一条连接借给第二条传输，见 mgmt_mqtt.lua）：
-  bms_uplink.subscribe(topic, fn)        订阅主题，fn(topic, payload) 在 recv 事件里被调用
+  bms_uplink.subscribe(topic, fn)        订阅主题，fn(topic, payload) 由下行任务调用
   bms_uplink.publish(topic, payload, qos) 借这条连接发布（未就绪返回 false）
   bms_uplink.client() / device_id()      取连接对象 / 设备 ID（IMEI）
   本机 clientId = username = IMEI，同 broker 同 clientId 只允许一条连接，
@@ -95,6 +95,7 @@ local stats = {
     last_payload_len = 0,
     last_publish_ms = nil,
     last_ts = 0,       -- 最近一次非空报文里的 BaseTimestamp（诊断）
+    rx_drop = 0,       -- 下行队列满而丢弃的 MQTT 载荷数（见 deliver）
 }
 
 --=============================================================================
@@ -111,19 +112,56 @@ local last_bms_uptime = 0    -- 最近已知的 BMS 上电秒数（空窗沿用�
 -- MQTT 总线：把这一条连接借给第二条传输用（管理 MQTT JSON-RPC，见 mgmt_mqtt.lua）
 --   本机 clientId = username = device_id（IMEI），同一个 broker 上同一 clientId 只允许一条
 --   连接（另开一条会把上报这条踢下线），所以管理 MQTT 不自己建连，而是**共用这一条**：
---     bms_uplink.subscribe(topic, fn)        订阅主题；fn(topic, payload) 在 recv 事件里同步调用
+--     bms_uplink.subscribe(topic, fn)        订阅主题；fn(topic, payload) 由下行任务（task_downlink）调用
 --     bms_uplink.publish(topic, payload, qos) 借这条连接发布（MQTT 未就绪返回 false）
 --     bms_uplink.client() / device_id() / is_mqtt_ready()
 --   订阅在每个 CONNACK 后**重放**一遍：autoreconn 重连后订阅不会丢（见 connect_mqtt）。
---   ⚠ 回调必须是同步、非阻塞的（在 MQTT 事件回调里执行），异常由 subscribe 侧自行 pcall 兜住。
+--   ⚠ recv 回调（libemqtt 经 msgbus 调起，跑在 rtos 消息泵里、不是协程）只做入队；
+--     真正的订阅回调在任务里跑：可以用 sys.wait，但别长时间占住队列（队列上限 16 条，
+--     满了丢最旧并计入 stats.rx_drop）。回调异常只丢这一条。
 --=============================================================================
 local subs = {}                 -- { { topic = string, fn = function } }
 
+-- 下行队列：mqttc:on 的 recv 回调由 libemqtt 经 msgbus 直接调起（跑在 rtos.receive
+-- 的消息泵里，**不是协程**）——在同一段里做 json.decode / 状态快照 / 编码会整段占住
+-- 调度器，串口接收回调也在同一个消息泵里跑（jk_modbus 512B@115200 只有 ≈44ms 余量）。
+-- 所以 recv 里只把「主题 + 载荷」入队并发一个事件，订阅回调统一在 task_downlink 里执行：
+--   · 传输层/管理服务的耗时工作不再占用消息泵；
+--   · 回调跑在任务里，因此内部可以安全使用 sys.wait / sys.waitUntil；
+--   · 先进先出，同一主题的请求顺序不变；队列有上限，满了丢最旧（主站超时重试兜底）。
+local RX_QUEUE_MAX = 16         -- 下行队列上限（条）；满则丢最旧，计入 stats.rx_drop
+local rx_queue = {}
+
 local function deliver(topic, payload)
-    for _, s in ipairs(subs) do
-        if s.topic == topic then
-            pcall(s.fn, topic, payload)
+    if #rx_queue >= RX_QUEUE_MAX then
+        table.remove(rx_queue, 1)
+        stats.rx_drop = stats.rx_drop + 1
+        d_warn("MQTT 下行队列满（", RX_QUEUE_MAX, "条），丢弃最旧一条")
+    end
+    rx_queue[#rx_queue + 1] = { topic = topic, payload = payload }
+    sys.publish("MQTT_DOWNLINK")
+end
+
+-- 把队列里的下行载荷依次交给订阅者（在任务上下文里跑；异常只丢这一条）
+local function deliver_pending()
+    while #rx_queue > 0 do
+        local item = table.remove(rx_queue, 1)
+        for _, s in ipairs(subs) do
+            if s.topic == item.topic then
+                local ok, err = pcall(s.fn, item.topic, item.payload)
+                if not ok then
+                    d_warn("订阅回调异常，已丢弃该条:", err)
+                end
+            end
         end
+    end
+end
+
+-- 下行投递任务：等事件（带超时兜底，事件丢了也不会把队列卡住）
+local function task_downlink()
+    while true do
+        sys.waitUntil("MQTT_DOWNLINK", 10000)
+        deliver_pending()
     end
 end
 
@@ -191,7 +229,13 @@ local function connect_mqtt()
             if board then board.set_net_led("blink") end
         elseif event == "error" then
             mqtt_ready = false
-            d_warn("mqtt error", data)
+            if data == "conack" then
+                d_error("mqtt CONNACK rejected: broker authentication/authorization failed "
+                    .. "(MQTT 3.1.1 code 0x05 = not authorized); check clientId, username, "
+                    .. "password and broker ACL")
+            else
+                d_warn("mqtt error", data)
+            end
         end
     end)
 
@@ -443,6 +487,9 @@ if MQTT_ENABLE then
 else
     log.info("uplink", "MQTT_HOST 未配置, 关闭 4G 上报（采集与金箭从机不受影响）")
 end
+
+-- 下行投递任务：订阅回调统一在这里执行（不占 MQTT 的 rtos 消息泵）
+sys.taskInit(task_downlink)
 
 --=============================================================================
 -- 对外接口
