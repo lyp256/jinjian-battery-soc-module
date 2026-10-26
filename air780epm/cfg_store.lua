@@ -60,6 +60,8 @@ M.SPEC = {
     -- 实时生效
     LOG_ENABLE                 = { type = "bool" },
     JK_MODBUS_POLL_MS          = { type = "int", min = 100, max = 60000 },
+    JK_PB485_POLL_MS           = { type = "int", min = 100, max = 60000 },
+    JK_PB485_TIMEOUT_MS        = { type = "int", min = 50, max = 10000 },
     JJ_LOW_TEMP_CHARGE_C       = { type = "int", min = -100, max = 100 },
     JJ_LOW_TEMP_DISCHARGE_C    = { type = "int", min = -100, max = 100 },
     -- 快充判定倍率（C）：判定电流 mA = 倍率 × 电池容量(Ah)，1 = 1C；小数（0.5C）用 float
@@ -67,7 +69,7 @@ M.SPEC = {
     -- [R] 重启后生效
     REPORT_PERIOD_MS           = { type = "int", min = 1000, max = 3600000 },
     STATUS_REPORT_MS           = { type = "int", min = 1000, max = 3600000 },
-    JK_PROTOCOL                = { type = "enum", values = { "display", "modbus" } },
+    JK_PROTOCOL                = { type = "enum", values = { "display", "modbus", "pb485" } },
     JK_MODBUS_SLAVE_ADDR       = { type = "int", min = 1, max = 247 },
     MQTT_PORT                  = { type = "int", min = 1, max = 65535 },
     MQTT_IS_SSL                = { type = "bool" },

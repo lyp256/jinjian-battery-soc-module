@@ -146,10 +146,11 @@ fota{mode, state, stage, result, progress, rx, total, last_seq,
 | `MGMT_BAUD` | 1200/2400/4800/9600/19200/38400/57600/115200 | `[R]` |
 | `LOG_ENABLE` | true/false | 实时 |
 | `JK_MODBUS_POLL_MS` | 100–60000 | 实时 |
+| `JK_PB485_POLL_MS` / `JK_PB485_TIMEOUT_MS` | 100–60000 / 50–10000 | 实时 |
 | `JJ_LOW_TEMP_CHARGE_C` / `JJ_LOW_TEMP_DISCHARGE_C` | -100…100（℃） | 实时 |
 | `JJ_FAST_CHARGE_C_RATE` | 0–10（C，充电倍率，可为小数；判定电流 = 倍率 × 容量 Ah，`1` = 1C，`0` = 只要在充电） | 实时 |
 | `REPORT_PERIOD_MS` / `STATUS_REPORT_MS` | 1000–3600000 | `[R]` |
-| `JK_PROTOCOL` | `display` / `modbus` | `[R]` |
+| `JK_PROTOCOL` | `display` / `modbus` / `pb485` | `[R]` |
 | `JK_MODBUS_SLAVE_ADDR` | 1–247 | `[R]` |
 | `MQTT_PORT` `MQTT_IS_SSL` `MQTT_QOS` `MQTT_KEEPALIVE_S` `MQTT_HOST` `MQTT_TOPIC_PREFIX` | 见 `config.lua` | `[R]` |
 

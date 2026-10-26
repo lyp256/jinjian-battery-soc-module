@@ -3,10 +3,8 @@
 基于银尔达 D700Tm（Air780EPM 方案）的 LuatOS Lua 工程：把极空（JK）保护板的电池数据
 转换成金箭电摩中控可读的 Modbus 从机数据，并通过 4G 以 MQTT 压缩上报。
 
-1. **采集**：从极空 BMS 保护板 RS485 接口取电池数据，两种协议**在配置里二选一**
-   （`JK_PROTOCOL`）：显示屏协议广播（2400 8N1，只收不发）或极空 RS485 Modbus 通用协议
-   （115200 8N1，本机做主站轮询），协议见 [极空显示屏协议.md](../docs/jikong/极空显示屏协议.md)
-   与 [JK-BMS-RS485.md](../docs/jikong/JK-BMS-RS485.md)；
+1. **采集**：从极空 BMS 保护板取电池数据，可在配置中选择显示屏协议广播（2400）、
+   RS485 Modbus（115200）或较新 PB/BD 系列的私有 `55 AA EB 90` 实时流（115200）；
 2. **协议转换**：作为 Modbus RTU 从设备（9600 8N1，从站地址 1）响应金箭中控的 BMS 查询，
    协议见 [金箭协议](../docs/jinjian)；
 3. **上报**：通过 4G 连接 MQTT 服务器，每 30 秒把「这一窗口新到达的真实样本」压缩上报
@@ -22,13 +20,14 @@
 
 ## 1. 数据流与文件结构
 
-采集与消费彻底解耦：协议解析（`jk_display`/`jk_modbus`）只产出各自的快照，`bms_data` 把两套
+采集与消费彻底解耦：协议解析（`jk_display`/`jk_modbus`/`jk_pb485`）只产出各自的快照，`bms_data` 把三套
 协议**归一成同一份「规范样本」**写进共享缓存，金箭从机与 4G 上报都**只读缓存**、互不干扰：
 
 ```
-极空保护板 ──RS485-3（UART3）──► jk.lua（按 config.JK_PROTOCOL 二选一）──"JK_ROUND"/一轮一条──┐
+极空保护板 ──RS485-3（UART3）──► jk.lua（按 config.JK_PROTOCOL 选择）──"JK_ROUND"/一轮一条──┐
    │  display: 2400 8N1 广播（只收） ──► jk_display.lua  解析/自检/失效标记           │
-   └─ modbus : 115200 8N1 主站轮询 ──► jk_modbus.lua   组帧/解析/失效标记             ▼
+   ├─ modbus : 115200 8N1 主站轮询 ──► jk_modbus.lua   组帧/解析/失效标记             │
+   └─ pb485  : 115200 私有实时帧 ────► jk_pb485.lua    300B 定界/SUM8/解析              ▼
                                             bms_data.lua 归一（只做字段/单位映射，不插值）
                                                     │ push（缓存分配 seq + 原始采集 ts）
                                                     ▼
@@ -63,9 +62,10 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 | `board.lua` | 板级资源：引脚复用（开机加载 `pins_Air780EPM.json`）、可控电压输出、NET LED、Reload 按键、硬件看门狗、供电电压、设备 ID/PN |
 | `pins_Air780EPM.json` | LuatIO 管脚表（银尔达 D700Tm）：PIN52/53 = UART3_TXD/RXD、PIN106 = GPIO25（RS485-1 方向）、PIN78 = GPIO28（看门狗）、PIN16 = GPIO27（NET LED）…；随脚本打包进 `/luadb/`，固件开机自动加载（见 §2.2） |
 | `air153C_wtd.lua` | 喂狗库（`board.lua` 实际使用）：GPIO28 每 30s 一个 400ms 正脉冲，开机先喂一次。**不要换用官方扩展库 `exair153x_wdt`**（本板喂不动，见 §8） |
-| `jk.lua` | 极空数据源入口：按 `config.JK_PROTOCOL` 转发到下面两个实现之一（接口完全一致） |
+| `jk.lua` | 极空数据源入口：按 `config.JK_PROTOCOL` 转发到下面三个实现之一（接口完全一致） |
 | `jk_display.lua` | 极空显示屏协议接收解析（帧定界、三类数据块、自检、数据失效标记） |
 | `jk_modbus.lua` | 极空 RS485 Modbus 主站（03H 读寄存器、CRC、轮询调度、单位换算、失效标记） |
+| `jk_pb485.lua` | 极空 PB/BD 私有 RS485 实时流（0x1620 触发、300B/SUM8、0x02 电芯帧解析） |
 | `bms_data.lua` | 采集适配层：`JK_ROUND` 快照 → 规范样本（字段/单位映射、固定 32 路单体槽位）→ `bms_cache`；`module_uptime_s()` 供上报 |
 | `bms_cache.lua` | 共享采样缓存：32 条环形缓冲，`push/latest/count/history/since/stats`，采集与消费解耦的唯一交汇点 |
 | `jinjian_slave.lua` | 金箭 Modbus RTU 从机（帧扫描、寄存器/开关量映射、写入、异常码）；数据只读 `bms_cache.latest()`，缓存为空按全 0 应答 |
@@ -97,7 +97,7 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 | RS485-1 | 串口1 | **管理链路**（`MGMT_*`，**115200** 8N1、点对点无从站地址，见 §7）：裸帧 RPC（`mgmt_uart.lua`）+ 统一管理服务（`mgmt.lua`）——读状态（`status.get`）、读写配置（`config.get`/`config.set`，写透持久化）、命令（重启/FOTA/恢复出厂）。UART1 是默认复用功能（PIN18=UART1_TXD、PIN17=UART1_RXD），不用 `pins.setup` |
 | RS485-1 EN | GPIO25 | 管理链路方向脚：`MGMT_RS485_DIR=25`、`MGMT_RS485_RX_LEVEL=0`，由串口驱动按收发自动切换（本板 RS485-1 是带方向控制的收发器，**必须显式控制**，见 §2.1） |
 | RS485-2 | 串口2 | 金箭中控 Modbus RTU 从机（9600 8N1）：`JJ_UART_ID=2`、`JJ_BAUD=9600`、`JJ_SLAVE_ADDR=1`（自动方向收发器，无方向脚） |
-| RS485-3 | 串口3 | 极空 BMS 数据源（`JK_PROTOCOL` 二选一）：广播只收 2400 8N1（`JK_UART_ID=3`、`JK_BAUD=2400`）或 Modbus 主站 115200 8N1（`JK_MODBUS_BAUD=115200`、`JK_MODBUS_SLAVE_ADDR=1`）。**本板 RS485-3 接的是 UART3 的 B 组：PIN53=UART3_RXD、PIN52=UART3_TXD**（收发器自动方向，无 EN）。UART3 不是默认复用功能，模块开机自动 `uart_pins` 复用；引脚组与排查见 §7.8 |
+| RS485-3 | 串口3 | 极空 BMS 数据源（`JK_PROTOCOL` 选择）：广播 2400 8N1、标准 Modbus 115200 或 PB/BD 私有实时流 115200。**本板 RS485-3 接的是 UART3 的 B 组：PIN53=UART3_RXD、PIN52=UART3_TXD**（收发器自动方向，无 EN）。UART3 不是默认复用功能，模块开机自动 `uart_pins` 复用；引脚组与排查见 §7.8 |
 | NET LED | GPIO27 | 状态指示（输出，高电平亮）：注册网络快闪 → 拨号成功慢闪 → MQTT 连上常亮 |
 | Reload 按键 | GPIO30 | 输入上拉，按下接 GND；长按 3s 重启模组 |
 | 硬件看门狗 | GPIO28 | 外置 Air153C/Air153D 的 WTDOG。**GPIO 高电平必须是 3.3V**（`pm.ioVol(pm.IOVOL_ALL_GPIO, 3300)`，D700Tm 资源表要求；26.04 NOCAM 固件默认只有 1.8V，1.8V 喂不动芯片）。喂狗用工程自带的 `air153C_wtd`：开机 `init(28)` 并立刻喂一次，之后独立任务每 30s 一个 400ms 正脉冲（`board.lua` 是 GPIO28 的唯一写入者；**不要换用 `exair153x_wdt`**，见 §8）。复位原因用管理链路读（`status.get` 的 `reset_reason`，见 §7.3） |
@@ -155,7 +155,7 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 
 ## 3. 极空数据源协议：显示屏广播 / RS485 Modbus（配置切换）
 
-极空保护板对外有两套协议，本项目按 `config.JK_PROTOCOL` 二选一，两者产出各自的快照
+极空保护板不同固件提供三套可用协议，本项目按 `config.JK_PROTOCOL` 选择，各实现产出同结构快照
 （`jk.get_state()`）；`bms_data` 再把它归一成**同一份规范样本**进共享缓存，金箭从机与
 4G 上报都读缓存、不用区分数据来源：
 
@@ -163,19 +163,27 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 |---|---|---|---|
 | `"display"`（默认） | 显示屏接口广播（解析要点见下一节） | 2400 8N1、单向广播、只收不发 | 无需轮询；但字段有缺失（无均衡电流/循环次数/实际容量），总容量靠 `剩余容量 ÷ SOC` 估算 |
 | `"modbus"` | RS485 Modbus 通用协议（[JK-BMS-RS485.md](../docs/jikong/JK-BMS-RS485.md)） | 115200 8N1、主从应答、本机做主站轮询 | 字段齐全：均衡电流、循环次数、循环容量、SOH、实际容量、充/放电 MOS 状态，另可读配置区与信息区 |
+| `"pb485"` | 较新 PB/BD 系列私有实时流 | 115200 8N1；写 `0x1620` 选择 BMS 后设备主动发 300B `55 AA EB 90` 帧 | 字段最完整；适合 `0x128A` 汇总 Modbus 读取无响应的新固件 |
 
-切换只需改 `config.lua` 的 `JK_PROTOCOL` 后重新烧录脚本；两个实现共用同一个串口与方向脚
+切换只需改 `config.lua` 的 `JK_PROTOCOL` 后重新烧录脚本；三个实现共用同一个串口与方向脚
 （`JK_UART_ID`、`JK_RS485_DIR_GPIO`），因为接的是同一根 485 线。`jk.lua` 只是转发入口，
 对外接口（`get_state`/`is_fresh`/`get_stats`/`MAX_CELLS`）与 `jk_display.lua` 完全一致。
 
 ### 3.1 Modbus 主站轮询（`jk_modbus.lua`）
 
 - 从机地址 `JK_MODBUS_SLAVE_ADDR`（默认 1），轮询周期 `JK_MODBUS_POLL_MS`（默认 1s），
-  单帧应答超时 `JK_MODBUS_TIMEOUT_MS`（默认 **120ms**；245 字节@115200 仅需 21ms，留足余量即可，
-  量程越短越不会在保护板掉线时长时间占着总线和日志），一轮 ≈ 3 帧请求（115200 下 <50ms）；
+  单帧应答超时 `JK_MODBUS_TIMEOUT_MS`（默认 **120ms**；最长响应 69 字节@115200 只需约 6ms，
+  留足余量即可），一轮最多 18 帧请求（115200 下通常约 100ms）；
   整轮失败后退避 `JK_MODBUS_RETRY_MS`（默认 2s）再重试，连续失败只在第 1、10、20… 次打日志；
-- 每轮读 3 块只读实时数据，**全部成功**才算一轮（任一块失败即整轮失败，不产出脏数据）：
-  `0x1200`×32（单体电压 mV）、`0x1240`×2（`CellSta` 在位位图）、`0x128A`×58（汇总）；
+- 每轮读 `0x1200`×32（单体电压 mV）和 `0x1240`×2（`CellSta` 在位位图）。汇总区实测
+  **`0x128A` 连 x32 都不响应**（设备直接无响应）。极空地址按字节偏移组织，
+  同一实体不能和相邻实体随意合并读取；实现按每个实体的自身宽度分别读取：
+  `0x128A×1`、`0x1290×2`、`0x1298×2`、`0x129C×1`、`0x129E×1`、`0x12A0×2`、
+  `0x12A4×1`、`0x12A6×1`、`0x12A8×2`、`0x12AC×2`、`0x12B0×2`、`0x12B4×2`、
+  `0x12B8×1`、`0x12BC×2`、`0x12C0×1`、`0x12C2×1`；
+- 总压、电流和 SOC 是必需字段；温度、报警、容量、循环、运行时间等其余字段
+  单独失败时仍产出核心样本，并令 `state.modbusComplete=false`、计数 `jk_deg`，
+  避免旧固件因某个尾部字段导致整链路无数据；
 - 汇总块字段（地址与 `esp32/main/jk_bms.c` 一致，实测与社区 esphome-jk-bms 相符）：
 
   | 寄存器 | 内容 | 换算 |
@@ -203,7 +211,55 @@ MQTT（通道 rpc，JSON-RPC）────────────► mgmt_mqtt
 - 容错：单帧 CRC/地址/字节数非法 → 重新同步并计数；请求无响应 → 计超时并在下次请求前丢弃
   迟到帧；超过 `JK_DATA_TIMEOUT_MS` 无成功轮询 → 快照标记 `stale`（供 `is_fresh()`/日志诊断）；
   金箭从机与 4G 上报只看共享缓存里的最后一份规范样本，不因 `stale` 而停答（缓存为空时按全 0/空帧）；
+- RS485 收发器若有 TX 回显，扫描器会按当前请求的期望字节数跨过回显/噪声寻找完整响应，
+  不把请求的起始地址高字节误当成响应长度；`jk_skip` 增长只表示见到疑似回显/错长度帧；
 - 本模块只读（功能码 03H），不写保护板配置（`0x1600` 写区未使用）。
+
+现场看周期 `stat` 行即可区分故障层级：
+
+| 字段 | 含义与判断 |
+|---|---|
+| `jk_req` / `jk_tx` | 已发请求数 / 字节数；持续增长说明固件确实在发 03H |
+| `jk_rx` | 收到的原始字节数；持续为 0 = 保护板无回传，先查从机地址、波特率、A/B 线、公共地和 UART3 引脚复用 |
+| `jk_to` | 请求超时数；随 `jk_req` 一起增长而 `jk_rx` 不增长，就是无应答而非“解析错” |
+| `jk_crc` / `jk_resync` | 收到字节但找不到 CRC 正确的帧，重点查 A/B 极性、终端电阻、干扰和波特率 |
+| `jk_skip` | 地址/功能码像响应但字节数不符，常见于 485 TX 回显；扫描器会继续找后面的正式响应 |
+| `jk_err` | 最近一次请求的具体错误，例如 `timeout`、`exception_0x02`；字节数不匹配看 `jk_skip` |
+
+`W/mqtt CONACK 0x05` 与极空 Modbus 无关，它是 MQTT 3.1.1 的 **Not authorized**：
+broker 拒绝了 clientId/用户名/密码或 ACL。当前固件约定是
+`clientId = username = IMEI`、`password = HMAC-SHA256(MQTT_HMAC_SECRET, IMEI)` 小写 hex；
+先确认 broker 端设备 ID 与 `MQTT_HMAC_SECRET` 完全一致，再检查 broker 是否允许该设备发布
+`<MQTT_TOPIC_PREFIX>/<IMEI>/status` 和订阅 `.../rpc`。
+
+### 3.2 PB/BD 私有实时流（`jk_pb485.lua`）
+
+部分新固件的 RS485 口会忽略 `0x128A` 起的汇总 Modbus 读请求，但仍支持极空 Console 使用的
+私有实时流。完整帧格式、字段偏移、校验算法与抓包验证见
+[JK-BMS-PB485私有实时帧解析.md](../docs/jikong/JK-BMS-PB485私有实时帧解析.md)。
+
+主站周期性发送：
+
+```text
+01 10 16 20 00 01 02 00 00 D6 F1
+```
+
+设备随后发送 300 字节帧：
+
+```text
+55 AA EB 90 | TYPE | 00 | DATA(293) | SUM8
+```
+
+- `TYPE=0x02` 为实时电芯信息，`TYPE=0x01/0x03` 分别为配置和设备信息，本模块只消费 `0x02`；
+- 帧长固定 300，SUM8 = 前 299 字节求和取低 8 位；
+- DATA 中的字段地址与 Modbus `0x1200` 区相同，按小端读取；同时兼容 24 槽和 32 槽布局；
+- 实测样本已固化为 `tools/fixtures/jk_pb485_300.hex`，自测核对总压、电流、SOC、容量、
+  循环、SOH、温度、充放电状态和校验和；
+- `pb485` 在 `bms_data` 中按“完整字段源”处理，不执行 display 模式的字段归零/容量估算。
+  同一份真实帧已端到端验证：金箭 `reg0/1/2/3/6/7/8/104/113` 与保护开关量正常生成；
+  MessageV1 的总压、电流、双路温度、循环容量、剩余容量、满充容量、BMS 运行时间和单体列正常生成；
+- 金箭协议本身只暴露前 24 路单体，因此 25–32 串电池仍只向车端发送前 24 路；MQTT 可保留最多 32 路；
+- 轮询参数为 `JK_PB485_POLL_MS`（默认 800ms）、`JK_PB485_TIMEOUT_MS`（默认 500ms）。
 
 ## 4. 极空显示屏广播解析要点
 
@@ -374,6 +430,7 @@ BLOB = SEQ(2 LE) | LEN(2 LE) | DATA(LEN)        （DATA ≤ 238 字节，偏移�
 收发规则：CRC 错 / VER 不符 / 超长分别计数丢弃；**同一时刻只允许一个请求在飞**；**回帧先于动作**
 （重启等命令在响应发完 200 ms 后才执行）；**同一 ID 在 `MGMT_DEDUP_WINDOW_MS`（默认 10 s）内
 重复到达且方法相同 → 直接重放缓存响应、不重复执行**（防止丢应答后主站重试造成二次重启/二次 FOTA）。
+去重表超过 `MGMT_DEDUP_MAX`（默认 256 条）时按最旧淘汰，保证内存有硬上限（主站高频换新 ID 也不会涨）。
 
 > ⚠ **主站每次请求都要用新的 ID**（`1–255`）。去重按「ID + 方法」生效，**读方法也一样**：
 > 10 s 内用同一个 ID 再发一次 `status.get` / `config.get`，拿回的是缓存响应（不是新采样）。
@@ -450,10 +507,12 @@ IMEI AT 查询），**不在请求路径里**——方法调用是纯函数、�
 | `MGMT_BAUD` | 1200/2400/4800/9600/19200/38400/57600/115200 | `[R]` |
 | `LOG_ENABLE` | true/false | 实时 |
 | `JK_MODBUS_POLL_MS` | 100–60000 | 实时 |
+| `JK_PB485_POLL_MS` | 100–60000 | 实时 |
+| `JK_PB485_TIMEOUT_MS` | 50–10000 | 实时 |
 | `JJ_LOW_TEMP_CHARGE_C` / `JJ_LOW_TEMP_DISCHARGE_C` | -100…100（℃） | 实时 |
 | `JJ_FAST_CHARGE_C_RATE` | 0–10（C，倍率，可为小数；阈值 = 倍率 × 容量 Ah，1 = 1C，0 = 只要在充电） | 实时 |
 | `REPORT_PERIOD_MS` / `STATUS_REPORT_MS` | 1000–3600000 | `[R]` |
-| `JK_PROTOCOL` | `display` / `modbus` | `[R]` |
+| `JK_PROTOCOL` | `display` / `modbus` / `pb485` | `[R]` |
 | `JK_MODBUS_SLAVE_ADDR` | 1–247 | `[R]` |
 | `MQTT_PORT` `MQTT_IS_SSL` `MQTT_QOS` `MQTT_KEEPALIVE_S` `MQTT_HOST` `MQTT_TOPIC_PREFIX` | 见 `config.lua` | `[R]` |
 
@@ -499,10 +558,14 @@ core+script 差分包；例如 `jjsoc_2052.1.0_LuatOS-SoC_Air780EPM.bin`），**
 **两条通道的数据块形态**：
 
 - **UART** 用 **BLOB 帧**：`TYPE=0x04`，载荷 = `SEQ(2 LE) | LEN(2 LE) | DATA(LEN)`，`DATA ≤ 238`；
-  **偏移由设备按已收字节自动推得**（主站不传 offset）。设备收到 BLOB 帧后与请求帧一样回一条
+**偏移由设备按已收字节自动推得**（主站不传 offset）。设备收到 BLOB 帧后与请求帧一样回一条
   RESP（同一 ID）：`{"ok":true,"result":{"seq":…,"rx":…,"total":…,"progress":…}}`；失败回错误码。
 - **MQTT** 用 `fota.chunk`：参数 `{"seq":<块序号，从 1 递增>,"data":"<BASE64>"}`，服务端解码后
   与 BLOB 走同一条写入路径（偏移同样由设备推得）。
+
+> ℹ **回帧先于动作**：`fota.init()` 与收尾（等 `isDone` + CRC32 + `finish`）都在后台任务里，
+> 任务体第一行先 `sys.wait(1)` 让出（`sys.taskInit` 本身会立刻执行到第一个 yield）。
+> 所以 `fota.begin` 和**最后一块**的响应帧都先发回主站，再做 Flash 动作。
 
 **升级流程**（主站视角）：
 
@@ -773,10 +836,12 @@ cd air780epm
 lua tools/selftest.lua
 ```
 
-当前 760 项全部通过（64 位与 32 位整数 Lua 各跑一遍都应是同样的「失败 0 项」，见下方"位宽差异"），覆盖：
+当前 801 项全部通过（64 位与 32 位整数 Lua 各跑一遍都应是同样的「失败 0 项」，见下方"位宽差异"），覆盖：
 
 > 自测需要 `config.lua` 已配置 `MQTT_HOST`（模板里留空 = 关闭 4G 上报；留空时上报相关用例会
-> FAIL，属配置差异而非代码问题）。主题前缀直接从 `config` 读取，不写死。
+> FAIL，属配置差异而非代码问题）。各协议解析用例会直接加载对应模块，不依赖当前
+> `JK_PROTOCOL` 值。主题前缀直接从 `config` 读取，不写死。
+> 其余可调项（如 `JJ_FAST_CHARGE_C_RATE`）用例会**自己设定**再还原，不依赖本地取值。
 
 1. `bms_codec`（MessageV1）与 `mqttagent/pkg/bms` §11 的**五条黄金向量字节级比对**：
    11.1 两样本×三电芯 = **53B**、11.2 三样本×两电芯全静态 = **42B**（modeTable 全常量）、
@@ -789,7 +854,8 @@ lua tools/selftest.lua
 3. `bms_cache`：32 条环形缓冲 push 40 条验覆盖、`latest`、`history` 闭区间（同秒多条、
    不插值不补零）、`since` 游标不重叠、被覆盖样本计入丢失、空缓存查询；
 4. `bms_data` 适配层：display 与 modbus 快照归一字段对照（`tempBat2C`、均衡电流、
-   循环总容量、满电容量、BMS 上电时间、`source`、32 路槽位补齐、非法快照返回 nil）；
+   循环总容量、满电容量、BMS 上电时间、`source`、32 路槽位补齐、非法快照返回 nil），
+   以及**采集任务用事件载荷归一**（事件排队时不会把同一份最新快照重复入缓存）；
 5. 极空整轮 364 字节样本（见 `docs/jikong/极空显示屏协议.md` §7）逐字段核对：总压/电流/SOC/温度/单体/串数、SOC 图标格数、
    剩余时间 7:39:37（时/分/秒）、u32 功率、`sysAlarm` 位图、颜色帧（蓝=最高第 1 串、
    红=最低第 7 串、绿=普通、黑=空槽）、扩展块与主块交叉校验；并覆盖 37 字节分片接收、
@@ -803,11 +869,15 @@ lua tools/selftest.lua
    循环总容量/剩余容量/单体）与鉴权参数（clientId=用户名=IMEI、密码=HMAC 小写 hex）、主题、QoS；
    并覆盖「未 NTP 对时不发布」「窗口非空发真实样本」「窗口为空只发 0 样本帧（不补零/不 keep-last）」；
 8. 极空 RS485 Modbus 主站（`jk_modbus`）：用 `uart.write` 打桩模拟一台从机，核对
-   请求组帧（`01 03 1200 0020` / `1240 0002` / `128A 003A`）与 CRC（文档样例 `0x0AD4`/`0xC64B`）、
-   三块寄存器的解析与单位换算（总压/电流/SOC/单体/温度/均衡电流/容量/循环/SOH/
+   请求组帧（单体块 `1200 0020` / `1240 0002`，汇总区按实体逐个读取）与 CRC
+   （文档样例 `0x0AD4`/`0xC64B`）、单体块与 16 个汇总实体的解析和单位换算（总压/电流/SOC/单体/温度/均衡电流/容量/循环/SOH/
    `0x12BC` RunTime）、`CellSta` popcount 串数、异常响应降级（不产出新样本、保留上一轮），
    以及同一份规范样本驱动金箭从机寄存器（`reg104` 来自 Modbus、保护开关量）与
    `SOCCycleCap`(列) / `SOCFullChargeCap`(消息级) 的语义核对；
+8b. 极空 PB/BD 私有 RS485 流（`jk_pb485`）：用真实 Console 抓取的 300 字节
+   `55 AA EB 90 02` 帧作为 fixtures，核对帧长/SUM8/选择命令，以及 20 串、总压
+   66081 mV、电流 -62 mA、SOC 95%、容量 54000 mAh、循环 14 次、SOH 100%、
+   两路电池温度和充放电状态；
 9. 单线程/不阻塞约定：编码分片钩子、原始帧 hex 限频（每 `LOG_HEX_EVERY_N` 帧一条），
    以及"串口回调只搬字节、解析由独立任务完成"的实现验证——金箭回调本身不应答、
    解析任务产出应答、突发 12 帧按 `JJ_PARSE_MAX_FRAMES` 分批处理，极空整轮同理
@@ -821,7 +891,9 @@ lua tools/selftest.lua
     `EBADVALUE`/`EBUSY`/`ENOLIB`/`EFOTA`/`EBADSEQ`/`EFLASH`）；`config.set` 白名单 +
     范围校验 + **整批原子**（混入非法键则一项都不落盘）+ `restart_required`；`cmd.reboot`
     **回帧先于动作**（动作排期 200ms）；`cmd.factory_reset` 清覆盖并置待生效；
-    **ID 去重**（同 ID + 同方法在窗口内只执行一次、超出窗口/换方法/换 ID 正常执行）；
+    **ID 去重**（同 ID + 同方法在窗口内只执行一次、超出窗口/换方法/换 ID 正常执行；
+    超过 `MGMT_DEDUP_MAX` 按最旧淘汰）；**慢外设刷新**（PN 只取一次、供电电压优先读
+    board 缓存、缓存为空时才自己开 ADC）；
     FOTA 编排（`fota.url`/`fota.begin`/`fota.chunk` base64/`fota_blob` BLOB/`fota.abort`）；
     `hello` 字段与 `fota` 事件（`MGMT_EVT`）触发；
 12. `cfg_store`：白名单/类型/范围校验（未知键、越界、枚举、类型、超长全部拒绝）、写透往返
@@ -834,6 +906,7 @@ lua tools/selftest.lua
     `isDone → (ok, done)`）下的状态机（idle→preparing→ready→receiving→verifying→
     success）、init/run 失败、`isDone` 超时·报错、CRC32 不匹配、主动中止、空闲超时、
     核心库缺失（`-1`）、同块幂等重试（不重复写 Flash）、顺序/偏移/长度校验、两条通道互斥、
+    **回帧先于动作**（`fota.begin` 与最后一块的响应先发回，再跑 `fota.init()` / 收尾）、
     `fota.wait()` 的返回值不参与流程（返回 false 也不影响）、`run` 第三个返回值作为未落盘缓存上报、
     全程不联网也不碰 `libfota2`；另核对标准 CRC32 向量与一条**位宽守卫**用例
     （新模块源码里不允许出现 32 位整数 Lua 装不下的整数字面量，见下方"位宽差异"）；
@@ -854,7 +927,8 @@ lua tools/selftest.lua
     拿到 `.../rpc/resp` 响应（走的是与上报同一条连接）；
 16. `main.lua` 开机整链路 smoke：真跑 `main.lua`，从 UART1 接收回调喂一帧裸帧 `status.get`
     能拿到 RESP（字段含 `device`/`links`/`cache`/`uplink`/`fota.caps`）；管理 MQTT RPC 随 main
-    接线（`net_ready` 后订阅、下行请求得上行响应）；17. `mgmt_uart` 诊断模式（`MGMT_ECHO_TEST`）
+    接线（`net_ready` 后订阅、下行请求得上行响应；recv 回调只入队，响应由下行任务回发）；
+    17. `mgmt_uart` 诊断模式（`MGMT_ECHO_TEST`）
     回环 + 心跳；18. 串口分配（极空 UART3 需引脚复用、管理 UART1 默认复用）。
 
 另有仓库根目录的 `hwsim.lua`（`lua hwsim.lua`，虚拟时钟跑真实链路，不需要硬件）：
@@ -909,8 +983,8 @@ cd <工程>/air780epm && <刚构建的>/src/lua tools/selftest.lua
 
 | 项 | 说明 |
 |---|---|
-| 极空数据源 | **配置二选一**：`JK_PROTOCOL="display"` 用显示屏协议广播（2400 8N1 只收），`"modbus"` 用 RS485 Modbus 主站轮询（115200）；广播缺的字段（循环次数、名义容量、充电设置等）用本地缓存/推算，Modbus 可直接读到 |
-| 采样粒度 | display 一条样本 = 一轮广播（本机 ≈2.17s，周期随固件版本 0.5–2.2s 变化）；modbus 一条样本 = 一次完整轮询（默认 1s，`JK_MODBUS_POLL_MS` 可调）。上报按 `REPORT_PERIOD_MS`（默认 30s）固定周期取「窗口内新到达的真实样本」，一包 1–30 条不等 |
+| 极空数据源 | **配置选择**：`display` 用 2400 广播，`modbus` 用标准 115200 Modbus，`pb485` 用新 PB/BD 的 300B 私有实时流；广播缺的字段用本地缓存/推算，后两者可读到完整字段 |
+| 采样粒度 | display 一条样本 = 一轮广播（约2.17s）；modbus 一条样本 = 一次完整轮询（默认1s）；pb485 一条样本 = 一个 `0x02` 实时帧（触发周期默认800ms）。上报按 `REPORT_PERIOD_MS` 固定周期取真实样本 |
 | 共享缓存 | `BMS_CACHE_SAMPLES`（默认 32）条环形缓冲：display ≈69s、modbus ≈32s 的历史，既覆盖 30s 上报窗口，也给消费端偶发卡顿留余量。金箭从机与 4G 上报共用这一份缓存，各自只读；被覆盖而没来得及上报的样本计入 `stat` 的 `lost` |
 | 0 样本帧 | 窗口内没有新样本（保护板掉线/未接入/这几秒没数据）时只发 MessageV1 的 0 样本帧（`flags bit10`，`aa 01 00 80 08` + 6 个消息级 uvarint，典型 11–20 字节；§11.5 黄金向量为 13 字节）。里面只有上电时间与两个 modbus 计数有意义，没有列数据，服务端不会把它当真实采样写库（`cmd/agent` 只为 `TimeSeries` 非空的报文写 `soc_full_charge` 等指标） |
 | 温度列 | display 主块只有一路电池温度（固件按工况在 T1/T2 间取一个填入），`temp1=temp2`；modbus 取 `0x129C`/`0x129E` 两路传感器。`tempMos` 两路一致 |
@@ -925,7 +999,7 @@ cd <工程>/air780epm && <刚构建的>/src/lua tools/selftest.lua
 | 配置持久化 | fskv 明文存「覆盖项 JSON」，只存被主站改过的键（不是整份 config），开机在业务模块 `require` 之前写回 config；`CFG_STORE_ENABLE=false` 或 fskv 不可用时退化为"每次重启都回 config.lua"，只告警不报错。MQTT 口令随其它配置一起明文存储（沿用"凭据随脚本下发"的既有基线，不引入加密） |
 | FOTA（URL 通道） | 管理主站下发 URL 触发 `libfota2` 下载；**下载成功不自动重启**（置状态 2 + 「需重启」，等主站发重启命令），现场可选合适时间点重启，避免下完就断服；FOTA 与上报共用 4G 链路，未联网不启动（限时等待后置失败） |
 | FOTA（本地通道） | 主站用 UART BLOB 帧 / MQTT `fota.chunk` 把 LuatOS `.bin` 载荷**分段流式**写进设备（核心库 `fota.init/run/isDone/finish` 直接写 Flash）：不联网、不落文件、不依赖 `libfota2`。**偏移由设备按已收字节自动推得**（主站只给 SEQ）；收齐后（可选）校验整包标准 CRC32，成功同样只置「状态 2 + 需重启」，由主站下重启命令；同块重发幂等、60s 空闲自动取消、失败/中止重启仍是旧版本。代价：需要主站按顺序分块（§7.5），且**不做签名校验**（与 URL 通道同一安全基线） |
-| 管理 MQTT JSON-RPC | 与 UART1 并列的第二条管理传输（§7.7），复用同一个 `mgmt` 服务的方法/字段/错误码；**通道 = 主题后缀**（默认 `rpc`，下行 `<prefix>/<device>/rpc`、上行 `.../rpc/resp`），`MGMT_MQTT_ENABLE` 默认开。代价：与上报**共用同一条 MQTT 连接**（clientId=IMEI 只允许一条），所以 `MQTT_HOST` 未配置、或 broker 掉线时这条通道也跟着不可用；载荷是明文 JSON（与 RTU 同一安全基线，不带签名/加密）；响应 QoS 取 `MQTT_QOS`（默认 0，偶发丢包由主站超时重试兜底） |
+| 管理 MQTT JSON-RPC | 与 UART1 并列的第二条管理传输（§7.7），复用同一个 `mgmt` 服务的方法/字段/错误码；**通道 = 主题后缀**（默认 `rpc`，下行 `<prefix>/<device>/rpc`、上行 `.../rpc/resp`），`MGMT_MQTT_ENABLE` 默认开。recv 回调（rtos 消息泵上下文）只入队，处理与回发在下行任务里做——所以 MQTT 侧的长耗时处理（`status.get` 的 JSON 编解码等）不会挡住串口接收回调。代价：与上报**共用同一条 MQTT 连接**（clientId=IMEI 只允许一条），所以 `MQTT_HOST` 未配置、或 broker 掉线时这条通道也跟着不可用；载荷是明文 JSON（与 RTU 同一安全基线，不带签名/加密）；响应 QoS 取 `MQTT_QOS`（默认 0，偶发丢包由主站超时重试兜底） |
 | 保留字段 | 扩展块偏移 36/38（内部状态 A/B）含义未定，只存不判 |
 
 ## 11. 单线程不阻塞约定
@@ -945,6 +1019,11 @@ LuatOS 是**单线程协作式**调度：任何任务长时间不让出，都会
    只做整帧校验 + `fota.run(块)`（几十字节的常数时间工作），`fota.init()`、
    收尾（等 `isDone` + CRC32 + `finish`）都在**后台任务**里跑，60s 空闲超时用独立任务计时，
    所以「主站发一个 238 字节的块」不会把从机任务卡住（§11.2 的 `sys.wait` 只在后台任务里）。
+   注意 `sys.taskInit` 会**立刻**把任务跑到第一个 yield（不是延迟执行）：后台任务体第一行
+   必须 `sys.wait(1)`（`fota_mgr` 的 init/收尾任务就是这么写的），否则重活照样跑在
+   应答路径上。管理 MQTT（§7.7）同理：`mqttc:on` 的 recv 回调跑在 rtos 消息泵里、不是协程，
+   所以 `bms_uplink.deliver` 只入队 + `sys.publish("MQTT_DOWNLINK")`，订阅回调
+   （`mgmt_mqtt` 的 JSON-RPC 处理）统一由下行任务执行。
    `jk_modbus.lua` 是唯一例外：它只做帧定界 + CRC（常数时间、单帧 ≤245 字节），
    且处在请求/应答的时序路径上，多一次任务唤醒会直接影响超时判定，故保留在回调内。
 3. **长 CPU 段分片让出**：`bms_codec.encode(hist, meta, on_slice)` 每编码 16 列回调一次，
@@ -953,14 +1032,18 @@ LuatOS 是**单线程协作式**调度：任何任务长时间不让出，都会
 4. **同步外设逐次让出**：供电电压采样按 `board.lua` 的 `ADC_SAMPLES`（默认 3）逐次 `adc.get`，
    每次之间 `sys.wait(1)`（单次 ADC 转换是同步的，部分固件是忙等）。
 5. **日志限频**：`LOG_RAW_FRAMES` 打开时，原始帧 hex 每 `LOG_HEX_EVERY_N`（默认 20）帧
-   打一条（轮询每秒 3 帧、单帧最多 490 字符 hex，不限频会自己挤占调度）。
+   打一条（轮询每秒最多 18 帧、单帧最多 138 字符 hex，不限频仍会挤占调度）。
 6. **失败退避**：Modbus 轮询整轮失败后按 `JK_MODBUS_RETRY_MS`（默认 2s）退避，
    连续失败只在第 1、10、20… 次打日志；`JK_MODBUS_TIMEOUT_MS` 默认 120ms
-   （3 块最坏 360ms，不会长时间占住总线）。
+   （全部 18 个读取都无响应时最坏约 2.2s，然后进入 2s 退避）。
 7. **等待＝挂起协程**：`sys.waitUntil` 事件不来时任务休眠、不占 CPU；几处"无超时等待"
    完全是设计意图（如等 `JK_ROUND`）。为避免"卡住看不出"，等 `net_ready` 这类关键等待
    改成"限时等待 + 周期打印"，超时只是可观测性，不是阻塞。
-8. **事件不排队**：`sys.publish` 只保留最后一次事件值，消费端不及时会丢轮。
+8. **事件是排队投递的，消费端要用事件载荷**：LuatOS 的 `sys.publish` 是
+   `table.insert(messageQueue, {...})` 的**真队列**（由调度器 `dispatch` 逐条投递，
+   不是"只保留最后一次"）。所以消费端被卡住时事件会排队，**必须用 `sys.waitUntil` 的
+   第二个返回值（载荷）**，不能"收到事件后回头读最新状态"——否则多条排队事件会读到
+   同一份最新快照，产生重复样本（`bms_data` 已按载荷归一，见其任务注释）。
    `JK_ROUND` 只有 `bms_data` 一个消费端，每条只做一次字段映射（微秒级）后立即 `push`
    进共享缓存；金箭从机与 4G 上报都**只读缓存**（`latest` / `since`）、不监听事件，
    所以上报任务偶发卡顿只影响「窗口大小」，不会丢轮、也不会复用到正在编码的缓冲。

@@ -75,14 +75,15 @@ function M.module_uptime_s()
     return 0
 end
 
--- 极空两套协议的快照 → 规范样本；s 非法时返回 nil
+-- 极空 display/modbus/pb485 三种快照 → 规范样本；s 非法时返回 nil
 function M.normalize(s)
     if type(s) ~= "table" then
         return nil
     end
 
     local source = s.source or "display"
-    local modbus = (source == "modbus")
+    -- modbus 与 pb485 都提供完整字段；display 缺的字段才需要归零/估算。
+    local full = (source == "modbus" or source == "pb485")
 
     local cellCount = math.floor(num(s.cellCount, 0))
     if cellCount < 0 then
@@ -108,7 +109,7 @@ function M.normalize(s)
 
     -- 电池温度：display 只有一路（固件按工况在 T1/T2 间取一个填入），两路写同值
     local tempBat1C = math.floor(num(s.tempBatC, 0))
-    local tempBat2C = modbus and math.floor(num(s.tempBat2C, tempBat1C)) or tempBat1C
+    local tempBat2C = full and math.floor(num(s.tempBat2C, tempBat1C)) or tempBat1C
 
     return {
         ts = math.floor(num(s.ts, os.time())),
@@ -121,14 +122,14 @@ function M.normalize(s)
         tempBat2C = tempBat2C,
         tempMosC = math.floor(num(s.tempMosC, 0)),
         -- display 广播没有均衡电流
-        balanCurrentMa = modbus and math.floor(num(s.balanCurrentMa, 0)) or 0,
+        balanCurrentMa = full and math.floor(num(s.balanCurrentMa, 0)) or 0,
         -- 满电总容量：display 用「剩余容量 ÷ SOC」估算（jk_display.fullCapMah），modbus 直读 0x12AC
         socFullChargeCapMah = math.floor(num(s.fullCapMah, 0)),
         socCapRemainMah = math.floor(num(s.capRemainMah, 0)),
         -- 循环总容量：display 没有该字段（写 0），modbus 取 0x12B4
-        socCycleCapMah = modbus and math.floor(num(s.cycleCapMah, 0)) or 0,
-        cycleCount = modbus and math.floor(num(s.cycleCount, 0)) or 0,
-        soh = modbus and math.floor(num(s.soh, 0)) or 0,
+        socCycleCapMah = full and math.floor(num(s.cycleCapMah, 0)) or 0,
+        cycleCount = full and math.floor(num(s.cycleCount, 0)) or 0,
+        soh = full and math.floor(num(s.soh, 0)) or 0,
         sysAlarm = math.floor(num(s.sysAlarm, 0)),
         sysAlarmValid = s.sysAlarmValid == true,
         -- 9 个图标位：display 缺扩展块时金箭保护位回退要用（见 jinjian_slave.protection_bits）
@@ -137,7 +138,7 @@ function M.normalize(s)
         chargeMos = (num(s.chargeMos, 0) ~= 0) and 1 or 0,
         dischargeMos = (num(s.dischargeMos, 0) ~= 0) and 1 or 0,
         -- BMS 上电时间：modbus 取 0x12BC RunTime，display 无来源记 0
-        bmsUpTimeS = modbus and math.floor(num(s.bmsUpTimeS, 0)) or 0,
+        bmsUpTimeS = full and math.floor(num(s.bmsUpTimeS, 0)) or 0,
         source = source,
     }
 end
@@ -145,14 +146,23 @@ end
 --=============================================================================
 -- 采集任务：JK_ROUND（一轮一条）→ 规范样本 → 缓存
 --   · 只做字段映射（微秒级），不会长时间占住调度器；
---   · sys.publish 只保留最后一次事件值，本任务每条都及时消费。
+--   · 用**事件载荷**（sys.waitUntil 的第二个返回值）做归一，而不是回头读 jk.get_state()：
+--     LuatOS 的 sys.publish 是真队列（table.insert(messageQueue, ...)），消费端被卡住时
+--     事件会排队，回头读状态会让多条排队事件读到同一份最新快照 → 同一 ts 的重复样本；
+--     用载荷则每条事件对应自己那一轮的快照。
+--   · 载荷不是表（老调用方/自测里 publish 不带数据）时，才回退读 jk.get_state()。
 --=============================================================================
 sys.taskInit(function()
     while true do
-        if sys.waitUntil("JK_ROUND") then
+        local got, evt = sys.waitUntil("JK_ROUND")
+        if got then
             stats.rounds = stats.rounds + 1
-            local ok, s = pcall(jk.get_state)
-            local sample = ok and M.normalize(s) or nil
+            local snap = type(evt) == "table" and evt or nil
+            if snap == nil then
+                local ok, s = pcall(jk.get_state)
+                snap = ok and s or nil
+            end
+            local sample = M.normalize(snap)
             if sample then
                 cache.push(sample)
                 stats.pushed = stats.pushed + 1

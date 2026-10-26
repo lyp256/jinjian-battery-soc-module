@@ -151,6 +151,7 @@ function M.new(opts)
     local post = opts.post or default_post
 
     local dedup_window_ms = tonumber(cfg.MGMT_DEDUP_WINDOW_MS) or 10000
+    local dedup_cap = tonumber(cfg.MGMT_DEDUP_MAX) or 256   -- 去重条目硬上限（防高频唯一 ID 撑大内存）
     local snap_ttl_ms = tonumber(cfg.MGMT_SNAP_TTL_MS) or 1000
     local refresh_ms = tonumber(cfg.MGMT_SLOW_REFRESH_MS) or 5000
 
@@ -177,15 +178,28 @@ function M.new(opts)
         if not board then
             return
         end
-        if board.read_supply_voltage then
+        -- 供电电压：优先读 board 侧缓存（board 自己的周期任务在刷新），不要在这里
+        -- 再开关一次 ADC —— 两个任务并发 open/get/close 同一个 ADC 会交错，读数会抖。
+        -- 只有 board 没提供缓存接口（老版本 / 打桩）时才退回自己读。
+        if board.supply_voltage then
+            local mv = board.supply_voltage()
+            if mv then
+                supply_mv = mv
+            end
+        end
+        -- 缓存还没填上（开机瞬间 board 的周期任务正在读）时才自己读一次；
+        -- board.read_supply_voltage 已做防重入，两个任务并发也不会交错开关 ADC。
+        if supply_mv == nil and board.read_supply_voltage then
             local mv = board.read_supply_voltage()   -- 允许挂起：只跑在后台任务里
             if mv then
                 supply_mv = mv
             end
         end
-        if board.pn then
+        -- PN 是开机常量（IMEI 派生的 SOC-xxxxxxxxxxxx）：取到一次就不要再问了
+        -- （board.pn() 会走 mobile.imei()，不同 BSP 可能是缓存也可能是 AT 查询）
+        if pn_cached == nil and board.pn then
             local p = board.pn()
-            if p then
+            if p and p ~= "" then
                 pn_cached = p
             end
         end
@@ -622,6 +636,25 @@ function M.new(opts)
         end
     end
 
+    -- 按容量淘汰最旧：主站用递增 ID 高频请求时，窗口内可能有几百条响应（每条都握着
+    -- 一份 status 大表的引用）。窗口清理不够用时，再按条数硬砍，保证内存有硬上限。
+    local function dedup_trim(cap)
+        while dedup_n > cap do
+            local oldest_key, oldest_at = nil, nil
+            for k, v in pairs(dedup) do
+                if oldest_at == nil or v.at < oldest_at then
+                    oldest_key, oldest_at = k, v.at
+                end
+            end
+            if oldest_key == nil then
+                dedup_n = 0
+                break
+            end
+            dedup[oldest_key] = nil
+            dedup_n = dedup_n - 1
+        end
+    end
+
     --======================= 对外：请求 → 响应信封 =======================
     -- payload：JSON 字符串（UART）或已解码的表（MQTT）；id：帧 ID（UART）或 JSON 里的 id（MQTT）
     local function handle(payload, id)
@@ -670,6 +703,7 @@ function M.new(opts)
                 dedup_n = dedup_n + 1
             end
             dedup[key] = { method = method, at = t, resp = resp }
+            dedup_trim(dedup_cap)     -- 插完再裁：条目数严格 <= cap（满了丢最旧）
             return resp
         end
         return envelope(method, req.params)

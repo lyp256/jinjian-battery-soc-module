@@ -17,9 +17,10 @@
   config.lua          集中配置（串口/GPIO/波特率/MQTT/批次/管理链路等）
   cfg_store.lua       运行期配置持久化（fskv）：开机覆盖 config 表，写透 + 恢复出厂
   board.lua           D700Tm 板级资源（LED/按键/看门狗/可控电源/供电电压/设备 ID）
-  jk.lua              极空数据源入口：按 config.JK_PROTOCOL 转发到下面两个实现之一
+  jk.lua              极空数据源入口：按 config.JK_PROTOCOL 转发到下面的实现之一
   jk_display.lua      极空显示屏协议接收解析（2400 广播，只收），每轮发布 "JK_ROUND"
   jk_modbus.lua       极空 RS485 Modbus 主站轮询（115200），每轮发布 "JK_ROUND"
+  jk_pb485.lua        极空 PB/BD 私有 300 字节实时帧（115200），每轮发布 "JK_ROUND"
   bms_data.lua        采集适配层：JK_ROUND 快照 → 规范样本 → bms_cache
   bms_cache.lua       共享采样缓存（环形，默认 32 条），采集与消费解耦
   jinjian_slave.lua   金箭 Modbus RTU 从机（只读 bms_cache.latest()）
@@ -47,6 +48,9 @@ _G.sysplus = require("sysplus")
 log.info("main", PROJECT, MODEL, VERSION, rtos.bsp())
 
 sys.taskInit(function()
+    collectgarbage("setpause", 120)
+    collectgarbage("setstepmul", 180)
+    rtos.autoCollectMem(50, 70, 85)
     while true do
         local total, used, peak = rtos.meminfo("lua")
         log.info(string.format("内存使用率: %.2f%% 总计: %.2f KB  已用: %.2f KB  可用: %.2f KB  峰值: %.2f KB",
@@ -120,9 +124,18 @@ sys.taskInit(function()
             local mbs = mgmt_uart.get_stats() or {}
             local mqs = mgmt_mqtt.get_stats() or {}
             local fi = fota_mgr.info()
+            local jk_err = tostring(jks.last_error or "-"):gsub("%s+", "_")
             local fields = {
                 "jk_rounds", jks.rounds, "jk_frames", jks.frames,
                 "jk_rx", jks.rx_bytes or 0, "jk_sync", jks.sync_lost or 0,
+                -- Modbus 主站的现场判据：有请求但 jk_rx=0 → 无回传；jk_to 增长 → 超时；
+                -- jk_bad/jk_crc 增长 → 已有字节但帧损坏；jk_skip 增长 → 常见于 485 TX 回显。
+                "jk_req", jks.requests or 0, "jk_tx", jks.tx_bytes or 0,
+                "jk_to", jks.timeouts or 0, "jk_bad", jks.bad_response or jks.bad_len or 0,
+                "jk_crc", jks.bad_crc or 0, "jk_skip", jks.bytecount_mismatch or 0,
+                "jk_late", jks.late_frames or 0, "jk_resync", jks.resync or 0,
+                "jk_deg", jks.degraded or 0,
+                "jk_err", jk_err,
                 "ctrl_query", jjs.queries, "ctrl_reply", jjs.responses,
                 "ctrl_ignored", jjs.ignored, "ctrl_rx", jjs.rx_bytes or 0,
                 "mg_rx", mbs.rx_bytes or 0, "mg_frames", mbs.frames or 0,

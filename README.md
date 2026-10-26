@@ -20,6 +20,7 @@
 | [`docs/jinjian/01_BLE_PROTOCOL.md`](docs/jinjian/01_BLE_PROTOCOL.md) | 金箭智行 BLE 控制协议 |
 | [`docs/jinjian/03_BMS_COLLECTION_REPORT.md`](docs/jinjian/03_BMS_COLLECTION_REPORT.md) | BMS 上报消息清单与实现要点 |
 | [`docs/jikong/JK-BMS-RS485.md`](docs/jikong/JK-BMS-RS485.md) | 极空 JK-BMS RS485 Modbus 通用协议（V1.1） |
+| [`docs/jikong/JK-BMS-PB485私有实时帧解析.md`](docs/jikong/JK-BMS-PB485私有实时帧解析.md) | 极空 PB/BD 系列 RS485 私有 300 字节实时帧、字段与校验 |
 | [`docs/jikong/极空显示屏协议.md`](docs/jikong/极空显示屏协议.md) | 极空显示屏广播协议 |
 | [`docs/air780epm/MGMT_RPC.md`](docs/air780epm/MGMT_RPC.md) | Air780EPM 管理链路（RS485-1/UART1 裸帧 RPC + MQTT JSON-RPC）：帧格式、方法表、命令、FOTA |
 车。

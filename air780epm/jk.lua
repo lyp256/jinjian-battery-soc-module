@@ -1,6 +1,6 @@
 --[[
 @module  jk
-@summary 极空 BMS 数据源（按 config.JK_PROTOCOL 选择“显示屏广播”或“RS485 Modbus”）
+@summary 极空 BMS 数据源（按 config.JK_PROTOCOL 选择显示屏广播、Modbus 或 PB485）
 @version 1.0
 @date    2026.10.08
 @usage
@@ -12,6 +12,8 @@
   config.JK_PROTOCOL = "modbus"
       极空“RS485 接口”115200 8N1 主从轮询（本机为主站），见 jk_modbus.lua，
       协议见 docs/jikong/JK-BMS-RS485.md。
+  config.JK_PROTOCOL = "pb485"
+      较新 PB/BD 系列的 115200 私有 55 AA EB 90 实时帧，见 jk_pb485.lua。
 
 本模块只是转发：require "jk" 后拿到的是被选中实现本身，接口与 jk_display 相同：
     jk.get_state()   最近一轮快照（table 或 nil）
@@ -29,6 +31,9 @@ local M
 if cfg.JK_PROTOCOL == "modbus" then
     M = require "jk_modbus"
     log.info("jk", "数据源 = 极空 RS485 Modbus（主站轮询）")
+elseif cfg.JK_PROTOCOL == "pb485" then
+    M = require "jk_pb485"
+    log.info("jk", "数据源 = 极空 PB485（55 AA EB 90 实时帧）")
 else
     M = require "jk_display"
     log.info("jk", "数据源 = 极空显示屏协议（2400 广播，只收）")

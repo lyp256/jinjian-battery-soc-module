@@ -14,6 +14,7 @@ require "board" + board.init() 即可。
   board.power_output(bool)      可控电压输出开关，返回是否成功
   board.power_output_state()    当前输出状态
   board.read_supply_voltage()   读一次供电电压（mV），ADC 不可用时返回 nil
+  board.supply_voltage()        最近一次成功的供电电压（mV，只读缓存，不做 IO）
   board.device_id()             设备 ID（IMEI，取不到退回模组 unique_id）
   board.pn()                    模块 PN（SOC- + 12 位十六进制）
   board.pins_config_path()      开机加载的引脚复用表路径（nil = 没加载成功）
@@ -49,7 +50,7 @@ local POWER_SETTLE_MS  = 5                            -- 可控电压输出时�
 local LED_BLINK_MS     = 1000                         -- LED 慢闪半周期（未联网）
 local LED_FAST_MS      = 120                          -- LED 快闪半周期（联网中）
 local RELOAD_REBOOT_MS = 3000                         -- Reload 长按多久重启模组
-local RELOAD_SCAN_MS   = 50                           -- Reload 按键扫描周期
+local RELOAD_SCAN_MS   = 100                          -- Reload 按键扫描周期（长按判定按 RELOAD_REBOOT_MS/本值 折算）
 local WTD_FEED_MS      = 30000                        -- 喂狗周期（Air153C 超时最短约 209s，30s 有约 7 倍余量）
 local ADC_SCALE        = 273300 / 3300                -- 供电电压(mV) = ADC 电压(mV) × scale
 local ADC_SAMPLES      = 3                            -- 单次读取采样次数
@@ -183,23 +184,26 @@ end
 
 sys.taskInit(function()
     gpio.setup(HW.NET_LED, 0)
+    local level = 0                     -- 只在电平变化时写 GPIO（"on"/"off" 模式不必每秒重写）
     while true do
         local mode = led_mode
+        local want
         if mode == "on" then
-            gpio.set(HW.NET_LED, 1)
-            sys.wait(LED_BLINK_MS)
+            want = 1
         elseif mode == "blink" then
-            gpio.set(HW.NET_LED, 1)
-            sys.wait(LED_BLINK_MS)
-            gpio.set(HW.NET_LED, 0)
-            sys.wait(LED_BLINK_MS)
+            want = (level == 0) and 1 or 0
         elseif mode == "fast" then
-            gpio.set(HW.NET_LED, 1)
-            sys.wait(LED_FAST_MS)
-            gpio.set(HW.NET_LED, 0)
+            want = (level == 0) and 1 or 0
+        else
+            want = 0
+        end
+        if want ~= level then
+            level = want
+            gpio.set(HW.NET_LED, level)
+        end
+        if mode == "fast" then
             sys.wait(LED_FAST_MS)
         else
-            gpio.set(HW.NET_LED, 0)
             sys.wait(LED_BLINK_MS)
         end
     end
@@ -247,14 +251,29 @@ end)
 --   电压(mV) = ADC 电压(mV) × 273300 / 3300
 --=============================================================================
 
--- 读取一次供电电压，返回 mV；ADC 不可用时返回 nil
+-- 最近一次成功的供电电压读数（mV）；从未读到过时返回 nil
+local supply_mv_cached = nil
+local supply_reading = false
+
+function M.supply_voltage()
+    return supply_mv_cached
+end
+
+-- 读取一次供电电压，返回 mV；ADC 不可用时返回 nil（并回落到上次成功值）
+-- ⚠ 不可重入：本函数中间有 sys.wait，两个任务同时进会把 open/get/close 交错
+--   （表现为读数抖动或读不到）。这里用一个标志串行化：后到的调用直接拿缓存值。
 function M.read_supply_voltage()
     if adc == nil then
         return nil
     end
+    if supply_reading then
+        return supply_mv_cached
+    end
+    supply_reading = true
     adc.setRange(adc.ADC_RANGE_MAX)
     if not adc.open(HW.ADC_SUPPLY) then
-        return nil
+        supply_reading = false
+        return supply_mv_cached
     end
     -- 单次 adc.get 是同步转换（部分固件里是忙等，可能占用数 ms），因此逐次采样、每次
     -- 之间让出一次，避免一次读满多次把调度器占住（影响串口/网络任务）。
@@ -270,21 +289,24 @@ function M.read_supply_voltage()
         end
     end
     adc.close(HW.ADC_SUPPLY)
+    supply_reading = false
     if n == 0 then
-        return nil
+        return supply_mv_cached
     end
-    return (sum / n) * ADC_SCALE
+    supply_mv_cached = (sum / n) * ADC_SCALE
+    return supply_mv_cached
 end
 
+-- 后台刷新：先读一次（开机就能填上缓存，供 status.get 用），再按周期刷
 sys.taskInit(function()
     while true do
-        sys.wait(SUPPLY_REPORT_MS)
         local mv = M.read_supply_voltage()
         if mv then
             d_info(string.format("supply voltage %.2f V", mv / 1000))
         else
             d_warn("read supply voltage failed")
         end
+        sys.wait(SUPPLY_REPORT_MS)
     end
 end)
 

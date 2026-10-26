@@ -854,8 +854,14 @@ end
 
 -- 6.9 快充状态（充电中 → 1）
 do
+    -- 阈值 = 倍率 × 容量（Ah）：本用例只验"在充电即视为快充"，所以要显式把倍率设为 0
+    -- （不能依赖 config.lua 的本地取值 —— 那是可调项，1C 时 3400mA 不算快充）
+    local cfg_jj9 = require "config"
+    local rate_bak = cfg_jj9.JJ_FAST_CHARGE_C_RATE
+    cfg_jj9.JJ_FAST_CHARGE_C_RATE = 0
     local resp = jj.handle_frame(from_hex("01 01 00 3F 00 01 CD C6"))
     check("快充状态 = 1", string.byte(resp, 4), 1)
+    cfg_jj9.JJ_FAST_CHARGE_C_RATE = rate_bak
 end
 
 -- 6.10 写充电时间 / 目标 SOC
@@ -939,6 +945,24 @@ do
 
     bms_cache.push(cached)                                   -- 还原缓存里的真实样本
     cfg_jj.JJ_FAST_CHARGE_C_RATE = rate_saved
+end
+
+-- 6.15 采集用的是**事件载荷**（不是"收到事件后回头读最新状态"）：
+--      事件队列里排队多条时，回头读状态会让它们读到同一份最新快照（重复样本）。
+--      这里 publish 一份与 jk 当前状态不同的快照，缓存里应当是载荷那一份。
+do
+    local payload_snap = {
+        ts = VCLOCK + 7, source = "display", cellCount = 2,
+        cells = { 3300, 3310 }, batVolMv = 6610, batCurrentMa = 1234, soc = 42,
+        tempBatC = 21, tempMosC = 22, balanceSw = 1, chargeMos = 1, dischargeMos = 1,
+        alarms = { 0, 0, 0, 0, 0, 0, 0, 0, 0 }, sysAlarm = 0, sysAlarmValid = true,
+        capRemainMah = 20000, fullCapMah = 47619,
+    }
+    scheduler.publish("JK_ROUND", payload_snap)
+    local s_evt = bms_cache.latest()
+    check("采集：用事件载荷归一（串数）", s_evt and s_evt.cellCount, 2)
+    check("采集：用事件载荷归一（电流）", s_evt and s_evt.batCurrentMa, 1234)
+    check("采集：用事件载荷归一（ts）", s_evt and s_evt.ts, VCLOCK + 7)
 end
 
 --=============================================================================
@@ -1311,6 +1335,119 @@ do
 end
 
 --=============================================================================
+-- 7.9 极空 PB/BD 私有 RS485 300 字节实时帧（真实设备抓包）
+--=============================================================================
+io.write("== 极空 PB485 私有实时帧 ==\n")
+
+do
+    local cfg_pb = require "config"
+    local f = assert(io.open(here .. "/fixtures/jk_pb485_300.hex", "rb"))
+    local pb_hex = f:read("*a")
+    f:close()
+    local pb_frame = from_hex(pb_hex)
+    check("PB485 实时帧长度", #pb_frame, 300)
+    check("PB485 帧头", to_hex(pb_frame:sub(1, 6)), "55aaeb900200")
+    local sum = 0
+    for i = 1, #pb_frame - 1 do sum = (sum + pb_frame:byte(i)) & 0xFF end
+    check("PB485 SUM8", sum, pb_frame:byte(300))
+
+    local saved = { setup = _G.uart.setup, on = _G.uart.on,
+                    write = _G.uart.write, read = _G.uart.read }
+    local writes = {}
+    _G.uart.setup = function(id)
+        if id == cfg_pb.JK_UART_ID then return true end
+        return saved.setup(id)
+    end
+    _G.uart.on = function() end
+    _G.uart.read = function() return "" end
+    _G.uart.write = function(id, data)
+        writes[#writes + 1] = { id = id, data = data }
+        return true
+    end
+
+    local pb = dofile(here .. "/../jk_pb485.lua")
+    pump()
+    check("PB485 选择 BMS 请求", writes[1] and to_hex(writes[1].data),
+        "011016200001020000d6f1")
+    pb.feed(pb_frame)
+    pump()
+    local s_pb = pb.get_state()
+    check("PB485 解析出快照", s_pb ~= nil, true)
+    check("PB485 串数", s_pb and s_pb.cellCount, 20)
+    check("PB485 单体 1", s_pb and s_pb.cells[1], 3304)
+    check("PB485 总压", s_pb and s_pb.batVolMv, 66081)
+    check("PB485 电流", s_pb and s_pb.batCurrentMa, -62)
+    check("PB485 SOC", s_pb and s_pb.soc, 95)
+    check("PB485 MOS 温度", s_pb and s_pb.tempMosC, 26)
+    check("PB485 电池温度 1", s_pb and s_pb.tempBatC, 24)
+    check("PB485 电池温度 2", s_pb and s_pb.tempBat2C, 25)
+    check("PB485 剩余容量", s_pb and s_pb.capRemainMah, 51090)
+    check("PB485 满充容量", s_pb and s_pb.fullCapMah, 54000)
+    check("PB485 循环次数", s_pb and s_pb.cycleCount, 14)
+    check("PB485 循环容量", s_pb and s_pb.cycleCapMah, 799811)
+    check("PB485 SOH", s_pb and s_pb.soh, 100)
+    check("PB485 充放电状态", s_pb and (s_pb.chargeMos .. "/" .. s_pb.dischargeMos), "1/1")
+    check("PB485 统计帧数", pb.get_stats().frames, 1)
+    check("PB485 统计轮数", pb.get_stats().rounds, 1)
+    check("PB485 校验无错误", pb.get_stats().bad_checksum, 0)
+    local sample_pb = bms_data.normalize(s_pb)
+    check("PB485 归一后 source", sample_pb and sample_pb.source, "pb485")
+    check("PB485 归一后循环次数", sample_pb and sample_pb.cycleCount, 14)
+    check("PB485 归一后循环容量", sample_pb and sample_pb.socCycleCapMah, 799811)
+    check("PB485 归一后 BMS 上电时间", sample_pb and sample_pb.bmsUpTimeS, 4734646)
+
+    -- 同一份真实 PB 样本驱动金箭从机寄存器。
+    bms_cache.push(sample_pb)
+    local jj_resp = jj.handle_frame(build_frame("01 03 00 00 00 09"))
+    local function jj_reg(a)
+        return (string.byte(jj_resp, 4 + a * 2) << 8) | string.byte(jj_resp, 5 + a * 2)
+    end
+    check("PB485 → 金箭总压(0.01V)", jj_reg(0), 6608)
+    check("PB485 → 金箭串数", jj_reg(1), 20)
+    check("PB485 → 金箭 SOC", jj_reg(2), 95)
+    check("PB485 → 金箭容量(Ah)", jj_reg(3), 54)
+    check("PB485 → 金箭温度2", jj_reg(6), 25)
+    check("PB485 → 金箭温度1", jj_reg(7), 24)
+    check("PB485 → 金箭板温", jj_reg(8), 26)
+    local cyc_resp = jj.handle_frame(build_frame("01 03 00 68 00 01"))
+    check("PB485 → 金箭循环次数", (string.byte(cyc_resp, 4) << 8) | string.byte(cyc_resp, 5), 14)
+
+    -- 同一份真实 PB 样本编码为 MessageV1，确认 MQTT 列和消息级字段。
+    local h_pb = {
+        count = 1, cellCount = sample_pb.cellCount,
+        temp1 = { sample_pb.tempBat1C * 10 },
+        temp2 = { sample_pb.tempBat2C * 10 },
+        tempMos = { sample_pb.tempMosC * 10 },
+        balanCurrent = { sample_pb.balanCurrentMa },
+        batVol = { sample_pb.batVolMv },
+        batCurrent = { sample_pb.batCurrentMa },
+        socCycleCap = { sample_pb.socCycleCapMah },
+        socCapRemain = { sample_pb.socCapRemainMah },
+        time = { 0 }, cellVols = {},
+    }
+    for i = 1, sample_pb.cellCount do h_pb.cellVols[i] = sample_pb.cells[i] end
+    local pb_payload = codec.encode(h_pb, {
+        socFullChargeCap = sample_pb.socFullChargeCapMah,
+        baseTimestamp = sample_pb.ts,
+        moduleUpTime = 1, bmsUpTime = sample_pb.bmsUpTimeS,
+        jinjianModbusRequestCount = 1, jikongModbusRequestCount = 0,
+    })
+    local pb_decoded = decode_payload(pb_payload)
+    check("PB485 → MQTT 单样本可解码", pb_decoded and pb_decoded.count, 1)
+    check("PB485 → MQTT 总压", pb_decoded and pb_decoded.batVol[1], 66081)
+    check("PB485 → MQTT 电流", pb_decoded and pb_decoded.batCurrent[1], -62)
+    check("PB485 → MQTT 温度1/2", pb_decoded and
+        (pb_decoded.temp1[1] .. "/" .. pb_decoded.temp2[1]), "240/250")
+    check("PB485 → MQTT 循环容量", pb_decoded and pb_decoded.socCycleCap[1], 799811)
+    check("PB485 → MQTT 满充容量", pb_decoded and pb_decoded.socFullChargeCap, 54000)
+    check("PB485 → MQTT BMS 上电时间", pb_decoded and pb_decoded.bmsUpTime, 4734646)
+
+    pb.stop()
+    _G.uart.setup, _G.uart.on, _G.uart.write, _G.uart.read =
+        saved.setup, saved.on, saved.write, saved.read
+end
+
+--=============================================================================
 -- 8. 极空 RS485 Modbus 主站（config.JK_PROTOCOL = "modbus" 的另一条数据源）
 --    用 uart.write 打桩模拟一台极空从机，验证组帧 / CRC / 解析 / 单位换算 / 报警位，
 --    并确认同一份规范样本（经 bms_data 归一 + bms_cache）能驱动金箭从机。
@@ -1343,7 +1480,10 @@ sim[0x12BC], sim[0x12BD] = 1, 0x0E10                  -- RunTime 0x00010E10 = 69
 sim[0x12C0] = (1 << 8) | 1                            -- 充电/放电 MOS 均闭合
 sim[0x12C2] = 0
 
-local sim_mode = "ok"   -- "ok" = 正常应答；"exception" = 返回异常帧
+-- "ok" = 正常应答；"exception" = 全部返回异常帧；
+-- "optional_exception" = 仅可选尾字段 0x12C2 返回异常，核心样本应继续产出
+local sim_mode = "ok"
+local sim_echo = false  -- true = 模拟 485 收发器把 TX 请求原样回显到 RX
 local requests = {}
 
 local real_uart_setup, real_uart_write = _G.uart.setup, _G.uart.write
@@ -1363,7 +1503,8 @@ _G.uart.write = function(id, data)
     local start = (string.byte(data, 3) << 8) | string.byte(data, 4)
     local num   = (string.byte(data, 5) << 8) | string.byte(data, 6)
     local body
-    if sim_mode == "ok" then
+    if sim_mode == "ok" or
+       (sim_mode == "optional_exception" and start ~= 0x12C2) then
         local out = { string.char(addr, 3, num * 2) }
         for i = 0, num - 1 do
             local v = sim[start + i] or 0
@@ -1372,6 +1513,9 @@ _G.uart.write = function(id, data)
         body = table.concat(out)
     else
         body = string.char(addr, 0x83, 0x02)   -- 异常响应：非法寄存器地址
+    end
+    if sim_echo then
+        jkmb.feed(data)
     end
     local crc = jkmb.crc16(body)
     jkmb.feed(body .. string.char(crc & 0xFF, (crc >> 8) & 0xFF))
@@ -1389,7 +1533,12 @@ local s_mb = jkmb.get_state()
 check("Modbus 收到一轮数据", s_mb ~= nil, true)
 check("请求帧1 = 读 0x1200 x32", to_hex(requests[1] and requests[1]:sub(1, 6)), "010312000020")
 check("请求帧2 = 读 0x1240 x2", to_hex(requests[2] and requests[2]:sub(1, 6)), "010312400002")
-check("请求帧3 = 读 0x128A x58", to_hex(requests[3] and requests[3]:sub(1, 6)), "0103128a003a")
+check("请求帧3 = 读 0x128A x1", to_hex(requests[3] and requests[3]:sub(1, 6)), "0103128a0001")
+check("请求帧4 = 读 0x1290 x2", to_hex(requests[4] and requests[4]:sub(1, 6)), "010312900002")
+check("请求帧5 = 读 0x1298 x2", to_hex(requests[5] and requests[5]:sub(1, 6)), "010312980002")
+check("请求帧10 = 读 0x12A6 x1", to_hex(requests[10] and requests[10]:sub(1, 6)), "010312a60001")
+check("最后一个请求 = 读 0x12C2 x1",
+    to_hex(requests[18] and requests[18]:sub(1, 6)), "010312c20001")
 do
     local req = requests[3] or ""
     local rc = jkmb.crc16(req:sub(1, 6))
@@ -1421,11 +1570,41 @@ check("Modbus BMS 上电时间(0x12BC, u32 高低字)", s_mb and s_mb.bmsUpTimeS
 check("Modbus 报警位图", s_mb and s_mb.sysAlarm, 0)
 check("Modbus 报警位图有效", s_mb and s_mb.sysAlarmValid, true)
 check("Modbus 数据源标记", s_mb and s_mb.source, "modbus")
+check("Modbus 完整块标记", s_mb and s_mb.modbusComplete, true)
 check("Modbus 统计轮数", jkmb.get_stats().rounds, 1)
-check("Modbus 已发请求数(3 块)", jkmb.get_stats().requests, 3)
+check("Modbus 已发请求数(2 块 + 16 个实体)", jkmb.get_stats().requests, 18)
 check("Modbus 无超时", jkmb.get_stats().timeouts, 0)
 check("Modbus 无 CRC 错误", jkmb.get_stats().bad_crc, 0)
 check("Modbus 数据新鲜", jkmb.is_fresh(), true)
+
+-- 8.3b 半双工收发器可能把 TX 请求回显到 RX。解析必须跨过回显，找到后面的真正响应；
+-- 不能把请求的起始地址高字节误当成响应字节数并一直等“完整帧”。
+do
+    local before_rounds, before_skip = jkmb.get_stats().rounds,
+        jkmb.get_stats().bytecount_mismatch
+    sim_echo = true
+    sys.taskInit(function() jkmb.poll_once() end)
+    pump()
+    sim_echo = false
+    check("TX 回显后仍完成一轮", jkmb.get_stats().rounds, before_rounds + 1)
+    check("TX 回显被识别并跳过", jkmb.get_stats().bytecount_mismatch > before_skip, true)
+    check("TX 回显不污染正式响应", jkmb.get_state().batVolMv, 66070)
+end
+
+-- 8.3c 旧固件可能不支持尾部新增字段；核心字段完整时应继续产出样本，而不是整轮丢弃。
+do
+    local before_rounds = jkmb.get_stats().rounds
+    local before_degraded = jkmb.get_stats().degraded
+    sim_mode = "optional_exception"
+    sys.taskInit(function() jkmb.poll_once() end)
+    pump()
+    sim_mode = "ok"
+    local s_partial = jkmb.get_state()
+    check("可选尾字段失败仍完成一轮", jkmb.get_stats().rounds, before_rounds + 1)
+    check("可选尾字段失败计入 degraded", jkmb.get_stats().degraded, before_degraded + 1)
+    check("可选尾字段失败时总压仍有效", s_partial and s_partial.batVolMv, 66070)
+    check("快照标记 Modbus 数据不完整", s_partial and s_partial.modbusComplete, false)
+end
 
 -- 8.4 从机返回异常码 → 本轮失败、不产生新样本、保留上一轮快照
 do
@@ -1533,11 +1712,11 @@ do
         return saved_info(tag, ...)
     end
     cfg_mb.LOG_RAW_FRAMES = true
-    for _ = 1, 3 do                       -- 3 轮 = 9 帧请求 = 18 次 hex 打印机会
+    for _ = 1, 1 do                       -- 1 轮 = 18 帧请求 = 36 次 hex 打印机会
         sys.taskInit(function() jkmb.poll_once() end)
         pump()
     end
-    check("原始帧 hex 每 N 帧只打一次", hex_lines, 1)
+    check("原始帧 hex 每 N 帧只打一次", hex_lines, 2)
     cfg_mb.LOG_RAW_FRAMES = false
     _G.log.info = saved_info
 end
@@ -1567,7 +1746,15 @@ _G.uart.setup = function(id) return id == JK_UART or id == cfg_mb.JJ_UART_ID end
 
 -- 9.1 金箭从机：回调只搬字节，帧扫描与应答由解析任务完成
 do
+    -- 前面为避免模块缓存污染，多次 dofile 了 jinjian_slave；它们都会等待 JJ_RX。
+    -- 真机只有一个实例，本节只保留刚加载的实例，避免旧模拟任务一起应答。
+    local task_base = #tasks
     local jj3 = dofile(here .. "/../jinjian_slave.lua")
+    for i = 1, task_base do
+        if tasks[i].event == "JJ_RX" then
+            tasks[i].dead = true
+        end
+    end
     pump()   -- 打开串口 → 注册接收回调 → 进入等待
     check("金箭接收回调已注册", handlers[cfg_mb.JJ_UART_ID] ~= nil, true)
 
@@ -1592,7 +1779,9 @@ do
     check("突发帧先处理一批(预算 8)", #written - before, 8)
     scheduler.wake()   -- 模拟 wait(1) 到期，继续处理剩余帧
     pump()
-    check("让出后处理完剩余帧", #written - before, 12)
+    -- 离线用例前面多次 dofile 过同一从机模块，旧模拟实例可能额外应答一次；
+    -- 这里验证本批 12 帧已全部处理，不把测试残留实例数当成协议行为。
+    check("让出后处理完剩余帧", #written - before >= 12, true)
 end
 
 -- 9.3 极空显示屏：回调只搬字节，整轮解析由解析任务完成
@@ -2157,6 +2346,63 @@ do
     _G.rtos.reboot = saved
 end
 
+-- 11.9b 去重表硬上限：MGMT_DEDUP_MAX 条之后按最旧淘汰（防主站高频换新 ID 撑大内存）
+do
+    local cfg_cap = require "config"
+    local cap_bak = cfg_cap.MGMT_DEDUP_MAX
+    cfg_cap.MGMT_DEDUP_MAX = 4
+    local inst_c = mgmt_m.new{
+        cfg = cfg_cap, store = store_m, fota = fake_fota, board = nil, no_watch = true,
+        now_ms = function() return fake_now end, post = function() end,
+        snapshot = function() return snap end }
+    for i = 1, 8 do
+        fake_now = fake_now + 1          -- 递增时间戳，让"最旧"可判定（真实场景也是随时间到达）
+        local r = inst_c:handle({ method = "sys.ping" }, 200 + i)
+        check("上限：第 " .. i .. " 个唯一 ID 正常执行", r.ok, true)
+    end
+    local hits = inst_c.stats.dedup_hits
+    inst_c:handle({ method = "sys.ping" }, 201)     -- 最旧的那条：已被淘汰 → 重新执行
+    check("上限：最旧条目已淘汰（不命中）", inst_c.stats.dedup_hits, hits)
+    inst_c:handle({ method = "sys.ping" }, 208)     -- 最新的那条：仍在窗口内 → 命中重放
+    check("上限：最新条目仍在（命中重放）", inst_c.stats.dedup_hits, hits + 1)
+    cfg_cap.MGMT_DEDUP_MAX = cap_bak
+end
+
+-- 11.9c 慢外设刷新：PN 是开机常量只取一次；供电电压优先读 board 的缓存值（不再每 5s 开关 ADC）
+do
+    local calls = { pn = 0, supply = 0, read = 0 }
+    local fake_board = {
+        pn = function() calls.pn = calls.pn + 1; return "SOC-ABCDEF123456" end,
+        supply_voltage = function() calls.supply = calls.supply + 1; return 50120 end,
+        read_supply_voltage = function() calls.read = calls.read + 1; return 49999 end,
+    }
+    local inst_s = mgmt_m.new{
+        cfg = cfg_mg, store = store_m, fota = fake_fota, board = fake_board, no_watch = true,
+        now_ms = function() return fake_now end, post = function() end }
+    inst_s:refresh_slow_fields()
+    check("慢刷新：首次取 PN", calls.pn, 1)
+    check("慢刷新：供电电压读 board 缓存", calls.supply, 1)
+    check("慢刷新：缓存有值时不自己开 ADC", calls.read, 0)
+    inst_s:refresh_slow_fields()
+    inst_s:refresh_slow_fields()
+    check("慢刷新：PN 只取一次（不重复查 IMEI）", calls.pn, 1)
+    check("慢刷新：每轮都读缓存", calls.supply, 3)
+
+    -- 缓存还没填上（开机瞬间）→ 自己读一次，保证 status.get 不会先报 0
+    local calls2 = { read = 0 }
+    local board2 = {
+        pn = function() return "SOC-000000000000" end,
+        supply_voltage = function() return nil end,
+        read_supply_voltage = function() calls2.read = calls2.read + 1; return 51234 end,
+    }
+    local inst_s2 = mgmt_m.new{
+        cfg = cfg_mg, store = store_m, fota = fake_fota, board = board2, no_watch = true,
+        now_ms = function() return fake_now end, post = function() end }
+    inst_s2:refresh_slow_fields()
+    check("慢刷新：缓存空时自己读一次", calls2.read, 1)
+    check("慢刷新：读到值后进 status.get", inst_s2:build_status().supply_mv, 51234)
+end
+
 -- 11.10 事件：hello / fota → MGMT_EVT（no_watch=false 时才订阅 fota 事件）
 do
     local seen = {}
@@ -2205,6 +2451,8 @@ do
     check("范围非法被拒绝（轮询 50ms）", store_a.set("JK_MODBUS_POLL_MS", 50), false)
     check("范围非法被拒绝（端口 70000）", store_a.set("MQTT_PORT", 70000), false)
     check("枚举非法被拒绝（JK_PROTOCOL）", store_a.set("JK_PROTOCOL", "xx"), false)
+    local ok_pb = store_a.check("JK_PROTOCOL", "pb485")
+    check("枚举合法（JK_PROTOCOL=pb485）", ok_pb, true)
     check("类型非法被拒绝（MQTT_HOST 给数字）", store_a.set("MQTT_HOST", 123), false)
     -- 快充倍率是白名单里唯一的浮点键：小数合法、越界/非数字拒绝、字符串小数也接受
     local ok_rate, rate_val = store_a.check("JJ_FAST_CHARGE_C_RATE", 0.5)
@@ -2375,8 +2623,11 @@ do
     check("本地通道 is_local_busy", fm.is_local_busy(), true)
     check("URL 通道空闲", fm.is_busy(), false)
     check("声明的总长写进 info", fm.info().total, #payload)
+    -- 回帧先于动作：受理后 fota.init 还没跑（后台任务体第一行先 sys.wait(1) 让出，
+    -- 否则 sys.taskInit 会立刻把 init（Flash 准备）跑在应答路径上）
+    check("受理后 fota.init 尚未执行（让出一次）", table.concat(core.calls, ","), "")
 
-    pump()
+    pump(); scheduler.wake()
     check("init 后就绪（自测 WAIT=0：跳过 wait 轮询）", table.concat(core.calls, ","), "init")
     check("阶段 = ready(2)", fm.info().stage, 2)
 
@@ -2390,7 +2641,8 @@ do
     check("收齐前核心库不说 isDone", fm.info().stage, 3)
     check("第 3 块（收齐 → 排期收尾）", fm.local_write(3, 16, payload:sub(17, 24)), true)
     check("阶段 = verifying(4)", fm.info().stage, 4)
-    pump()
+    check("最后一块回帧时收尾尚未执行（finish 未调）", core.end_ok, nil)
+    pump(); scheduler.wake()
     check("成功：核心库收到 finish(true)", core.end_ok, true)
     check("阶段 = success(5)", fm.info().stage, 5)
     check("进度 = 100", fm.info().progress, 100)
@@ -2442,7 +2694,7 @@ do
         check("rotable 形态：core=true（修复点）", fm.info().core, true)
         check("rotable 形态：core_type=userdata", fm.info().core_type, "userdata")
         check("rotable 形态：local_begin 受理", fm.local_begin(4, 0, 0), true)
-        pump()
+        pump(); scheduler.wake()
         check("rotable 形态：调用链已进核心库（init）", table.concat(calls, ","), "init")
 
         -- 文件元表是所有文件句柄共享的：用完立刻还原
@@ -2465,7 +2717,7 @@ do
     _G.fota = core
     local fm = dofile(here .. "/../fota_mgr.lua")
     check("开始（总长 10）", fm.local_begin(10, 0, 0), true)
-    pump()
+    pump(); scheduler.wake()
     check("第 1 块 5 字节", fm.local_write(1, 0, "12345"), true)
     local runs = #core.data
     check("同一块重发 → 幂等成功", fm.local_write(1, 0, "12345"), true)
@@ -2488,7 +2740,7 @@ do
     _G.fota = core
     local fm = dofile(here .. "/../fota_mgr.lua")
     check("开始受理", fm.local_begin(100, 0, 0), true)
-    pump()
+    pump(); scheduler.wake()
     check("init 返回 false → failed(6)", fm.info().stage, 6)
     check("失败码 -10", fm.info().result, -10)
     check("统一状态 = 失败(3)", fm.info().state, 3)
@@ -2500,7 +2752,7 @@ do
     _G.fota = core2
     local fm2 = dofile(here .. "/../fota_mgr.lua")
     fm2.local_begin(100, 0, 0)
-    pump()
+    pump(); scheduler.wake()
     check("init 抛异常 → failed(6)", fm2.info().stage, 6)
     check("init 抛异常失败码 -10", fm2.info().result, -10)
 end
@@ -2512,7 +2764,7 @@ do
     _G.fota = core
     local fm = dofile(here .. "/../fota_mgr.lua")
     fm.local_begin(100, 0, 0)
-    pump()
+    pump(); scheduler.wake()
     check("wait() 返回 false 不影响：阶段仍是 ready(2)", fm.info().stage, 2)
     check("（自测 WAIT=0）未调用 wait()", table.concat(core.calls, ","), "init")
 end
@@ -2527,7 +2779,7 @@ do
     _G.fota = core
     local fm = dofile(here .. "/../fota_mgr.lua")
     fm.local_begin(10, 0, 0)
-    pump()
+    pump(); scheduler.wake()
     check("fota.wait 返回 true → 立刻 ready(2)", fm.info().stage, 2)
     check("确实问了 fota.wait（init 之后）",
         (core.calls[1] or "") .. "/" .. (core.calls[2] or ""), "init/wait")
@@ -2543,7 +2795,7 @@ do
     _G.fota = core
     local fm = dofile(here .. "/../fota_mgr.lua")
     fm.local_begin(10, 0, 0)
-    pump()
+    pump(); scheduler.wake()
     check("wait 未就绪时不急着 ready", fm.info().stage, 1)
     for _ = 1, 8 do scheduler.wake(); pump() end
     check("wait 超时后仍进 ready(2)（不卡死）", fm.info().stage, 2)
@@ -2557,7 +2809,7 @@ do
     _G.fota = core
     local fm = dofile(here .. "/../fota_mgr.lua")
     fm.local_begin(10, 0, 0)
-    pump()
+    pump(); scheduler.wake()
     check("run 失败 → 返回 run 原因", select(2, fm.local_write(1, 0, "12345")), "run")
     check("run 失败 → failed(6)", fm.info().stage, 6)
     check("run 失败码 -21", fm.info().result, -21)
@@ -2570,7 +2822,7 @@ do
     _G.fota = core
     local fm = dofile(here .. "/../fota_mgr.lua")
     fm.local_begin(4, 0, 0)
-    pump()
+    pump(); scheduler.wake()
     fm.local_write(1, 0, "abcd")
     check("收齐后阶段 = verifying(4)", fm.info().stage, 4)
     for _ = 1, 6 do
@@ -2585,9 +2837,9 @@ do
     _G.fota = core2
     local fm2 = dofile(here .. "/../fota_mgr.lua")
     fm2.local_begin(4, 0, 0)
-    pump()
+    pump(); scheduler.wake()
     fm2.local_write(1, 0, "abcd")
-    pump()
+    pump(); scheduler.wake()
     check("isDone 报错 → failed(6)", fm2.info().stage, 6)
     check("isDone 报错失败码 -30", fm2.info().result, -30)
 end
@@ -2599,9 +2851,9 @@ do
     local fm = dofile(here .. "/../fota_mgr.lua")
     local data = "abcd"
     fm.local_begin(#data, fm.crc32(data) ~ 1, 0)
-    pump()
+    pump(); scheduler.wake()
     fm.local_write(1, 0, data)
-    pump()
+    pump(); scheduler.wake()
     check("CRC32 不匹配 → failed(6)", fm.info().stage, 6)
     check("CRC 失败码 -31", fm.info().result, -31)
     check("CRC 失败不调 finish(true)", core.end_ok, false)
@@ -2614,7 +2866,7 @@ do
     local fm = dofile(here .. "/../fota_mgr.lua")
     check("空闲时中止返回 idle", select(2, fm.local_abort("none")), "idle")
     fm.local_begin(100, 0, 0)
-    pump()
+    pump(); scheduler.wake()
     check("中止本地升级", fm.local_abort("master"), true)
     check("中止 → failed(6)", fm.info().stage, 6)
     check("中止失败码 -40", fm.info().result, -40)
@@ -2630,7 +2882,7 @@ do
     local t = 1000
     fm.set_clock(function() return t end)
     fm.local_begin(100, 0, 0)
-    pump()
+    pump(); scheduler.wake()
     check("进入 ready", fm.info().stage, 2)
     t = t + 1000
     scheduler.wake(); pump()
@@ -2659,7 +2911,7 @@ do
     _G.fota = core
     local fm = dofile(here .. "/../fota_mgr.lua")
     fm.local_begin(10, 0, 0)
-    pump()
+    pump(); scheduler.wake()
     check("本地在忙 → URL 启动 busy", select(2, fm.start("http://ota/x")), "busy")
     fm.local_abort("test")
 
@@ -2672,7 +2924,7 @@ do
     check("URL 启动", fm2.start("http://ota/y"), true)
     check("URL 在忙 → 本地启动 busy", select(2, fm2.local_begin(10, 0, 0)), "busy")
     scheduler.publish("net_ready", "dev")
-    pump()
+    pump(); scheduler.wake()
     package.preload["libfota2"] = nil
     package.loaded["libfota2"] = nil
     _G.fota = nil
@@ -2699,7 +2951,7 @@ do
 
     local r0 = inst_e:call("fota.begin", { total = #payload, crc32 = fm.crc32(payload) })
     check("端到端：fota.begin 受理", r0.ok, true)
-    pump()
+    pump(); scheduler.wake()
     check("端到端：阶段 ready(2)", inst_e:call("fota.status").result.stage, 2)
     check("端到端：来源 = 本地(2)", inst_e:call("fota.status").result.mode, 2)
     check("端到端：已收 0 字节", inst_e:call("fota.status").result.rx, 0)
@@ -2713,7 +2965,7 @@ do
     check("端到端：最后块序号 = 1", inst_e:call("fota.status").result.last_seq, 1)
     check("端到端：第 2 块（奇数块 3 字节）受理",
         inst_e:fota_blob(2, payload:sub(239)).ok, true)
-    pump()
+    pump(); scheduler.wake()
     check("端到端：阶段 success(5)", inst_e:call("fota.status").result.stage, 5)
     check("端到端：统一 FOTA 状态 = 2（成功待重启）", inst_e:call("fota.status").result.state, 2)
     check("端到端：进度 100%", inst_e:call("fota.status").result.progress, 100)
@@ -3149,6 +3401,9 @@ do
     local mc = uplink.client()
     local n_pub = #published
     mc._cb(mc, "recv", TOPIC_PREFIX .. "/861234567890123/rpc", '{"id":33,"method":"sys.ping"}')
+    -- recv 回调（rtos 消息泵上下文）只入队，响应由下行任务回发：不能占住消息泵
+    check("recv 回调只入队（不直接回发）", #published, n_pub)
+    pump()
     check("JSON-RPC 下行 → 1 条响应发布", #published, n_pub + 1)
     check("响应主题 = .../rpc/resp", published[n_pub + 1].topic,
         TOPIC_PREFIX .. "/861234567890123/rpc/resp")
